@@ -5,11 +5,25 @@ import Foundation
 public struct StorageScanner: Sendable {
     public init() {}
 
+    /// macOS XNU kernel portals, virtual filesystems, and firmlink volume containers
+    /// that duplicate the root filesystem or do not represent user storage on the scanned disk.
+    public static let excludedVirtualPaths: Set<String> = [
+        "/.nofollow",
+        "/.resolve",
+        "/.vol",
+        "/dev",
+        "/Volumes",
+        "/System/Volumes",
+        "/net",
+        "/home"
+    ]
+
     /// Resource keys fetched during traversal.
     private static let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey,
         .isRegularFileKey,
         .isSymbolicLinkKey,
+        .isVolumeKey,
         .fileSizeKey,
         .fileAllocatedSizeKey,
         .totalFileAllocatedSizeKey,
@@ -18,6 +32,16 @@ public struct StorageScanner: Sendable {
         .linkCountKey,
         .fileResourceIdentifierKey
     ]
+
+    /// Returns true if `entryPath` is a macOS virtual/portal path that should not be traversed
+    /// unless the user explicitly selected that path (or a descendant of it) as `rootPath`.
+    public static func shouldSkipVirtualPath(_ entryPath: String, rootPath: String) -> Bool {
+        guard excludedVirtualPaths.contains(entryPath) else { return false }
+        if rootPath == entryPath || rootPath.hasPrefix(entryPath + "/") {
+            return false
+        }
+        return true
+    }
 
     /// Scans `rootURL` asynchronously. Reports periodic `ScanProgress` updates and handles Task cancellation gracefully.
     public func scan(
@@ -32,10 +56,15 @@ public struct StorageScanner: Sendable {
         let rootVolumeID = rootValues?.volumeIdentifier as? NSObject
 
         let state = TraversalState()
+        if let rootDirID = Self.identifierData(from: rootValues?.fileResourceIdentifier) {
+            state.seenDirectoryIDs.insert(rootDirID)
+        }
+
         let rootNode = traverseDirectory(
             url: standardizedRoot,
             rootPath: standardizedRoot.path,
             rootVolumeID: stayOnSameVolume ? rootVolumeID : nil,
+            stayOnSameVolume: stayOnSameVolume,
             state: state,
             progressHandler: progressHandler
         )
@@ -59,13 +88,24 @@ public struct StorageScanner: Sendable {
         var issues: [ScanIssue] = []
         var wasCancelled = false
         var seenHardLinkIDs: Set<Data> = []
+        var seenDirectoryIDs: Set<Data> = []
         var lastProgressReport = Date.distantPast
+    }
+
+    private static func identifierData(from raw: Any?) -> Data? {
+        if let data = raw as? Data { return data }
+        if let nsData = raw as? NSData { return nsData as Data }
+        if let coding = raw as? NSCoding {
+            return try? NSKeyedArchiver.archivedData(withRootObject: coding, requiringSecureCoding: false)
+        }
+        return nil
     }
 
     private func traverseDirectory(
         url: URL,
         rootPath: String,
         rootVolumeID: NSObject?,
+        stayOnSameVolume: Bool,
         state: TraversalState,
         progressHandler: (@Sendable (ScanProgress) -> Void)?
     ) -> StorageNode {
@@ -130,8 +170,8 @@ public struct StorageScanner: Sendable {
 
             let entryPath = entry.standardizedFileURL.path
 
-            // Prevent macOS APFS root firmlink / virtual filesystem recursion when scanning "/".
-            if rootPath == "/" && (entryPath == "/dev" || entryPath == "/Volumes" || entryPath == "/System/Volumes/Data") {
+            // Prevent macOS kernel portal (/.nofollow, /.resolve, /.vol) and firmlink/mount recursion.
+            if Self.shouldSkipVirtualPath(entryPath, rootPath: rootPath) {
                 continue
             }
 
@@ -164,16 +204,30 @@ public struct StorageScanner: Sendable {
                 continue
             }
 
-            // Enforce single-volume boundary when requested so external disks mounted inside root aren't double-counted.
-            if let rootVol = rootVolumeID, let entryVol = values.volumeIdentifier as? NSObject, !entryVol.isEqual(rootVol) {
-                continue
+            // Skip nested mount points and volume portals (e.g. /.nofollow, /System/Volumes/Data,
+            // CoreSimulator volumes, mounted disk images, external drives) when staying on one volume.
+            if stayOnSameVolume {
+                if values.isVolume == true {
+                    continue
+                }
+                if let rootVol = rootVolumeID, let entryVol = values.volumeIdentifier as? NSObject, !entryVol.isEqual(rootVol) {
+                    continue
+                }
             }
 
             if values.isDirectory == true {
+                // Guard against directory inode cycles or duplicate firmlink/portal bindings.
+                if let dirID = Self.identifierData(from: values.fileResourceIdentifier) {
+                    if !state.seenDirectoryIDs.insert(dirID).inserted {
+                        continue
+                    }
+                }
+
                 let childDir = traverseDirectory(
                     url: entry.standardizedFileURL,
                     rootPath: rootPath,
                     rootVolumeID: rootVolumeID,
+                    stayOnSameVolume: stayOnSameVolume,
                     state: state,
                     progressHandler: progressHandler
                 )
@@ -198,12 +252,11 @@ public struct StorageScanner: Sendable {
 
                 // Deduplicate multi-link hardlinks so physical space is not counted twice.
                 if let linkCount = values.linkCount, linkCount > 1,
-                   let resID = values.fileResourceIdentifier,
-                   let archived = try? NSKeyedArchiver.archivedData(withRootObject: resID, requiringSecureCoding: false) {
-                    if state.seenHardLinkIDs.contains(archived) {
+                   let resIDData = Self.identifierData(from: values.fileResourceIdentifier) {
+                    if state.seenHardLinkIDs.contains(resIDData) {
                         allocated = 0
                     } else {
-                        state.seenHardLinkIDs.insert(archived)
+                        state.seenHardLinkIDs.insert(resIDData)
                     }
                 }
 

@@ -125,4 +125,20 @@ final class StorageScannerAndTreemapTests: XCTestCase {
         XCTAssertEqual(customFiltered?.allocatedSize, 1_000)
         XCTAssertEqual(StorageAnalyzer.largestItems(in: root, filter: customFilter, relativeTo: now).map(\.name), ["mid.pdf"])
     }
+
+    func testSkipsMacOSVirtualPortalsAndNestedVolumePaths() {
+        // Scanning "/" must skip /.nofollow, /.resolve, /.vol, /System/Volumes, /Volumes, /dev
+        XCTAssertTrue(StorageScanner.shouldSkipVirtualPath("/.nofollow", rootPath: "/"))
+        XCTAssertTrue(StorageScanner.shouldSkipVirtualPath("/.resolve", rootPath: "/"))
+        XCTAssertTrue(StorageScanner.shouldSkipVirtualPath("/.vol", rootPath: "/"))
+        XCTAssertTrue(StorageScanner.shouldSkipVirtualPath("/System/Volumes", rootPath: "/"))
+        XCTAssertTrue(StorageScanner.shouldSkipVirtualPath("/System/Volumes", rootPath: "/System"))
+        XCTAssertTrue(StorageScanner.shouldSkipVirtualPath("/Volumes", rootPath: "/"))
+        XCTAssertTrue(StorageScanner.shouldSkipVirtualPath("/dev", rootPath: "/"))
+
+        // Scanning an external volume under /Volumes must NOT be blocked
+        XCTAssertFalse(StorageScanner.shouldSkipVirtualPath("/Volumes/Storage0", rootPath: "/Volumes/Storage0"))
+        XCTAssertFalse(StorageScanner.shouldSkipVirtualPath("/Volumes", rootPath: "/Volumes/Storage0"))
+        XCTAssertFalse(StorageScanner.shouldSkipVirtualPath("/Users", rootPath: "/"))
+    }
 }

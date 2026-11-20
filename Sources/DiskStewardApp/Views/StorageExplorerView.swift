@@ -161,8 +161,9 @@ struct StorageExplorerView: View {
                     Text(mode.displayName).tag(mode)
                 }
             }
+            .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 280)
+            .frame(width: 310)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
