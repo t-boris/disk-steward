@@ -1,8 +1,9 @@
 import CoreServices
 import Foundation
 
-/// Watches macOS directories via FSEvents and reports meaningful filesystem mutations
-/// so ScanCacheManager can automatically invalidate stale cached storage scans (DEC-012).
+/// Watches macOS directories via FSEvents and reports ONLY real structural or content mutations
+/// (create, delete, rename, content modify) so ScanCacheManager can incrementally rescan just
+/// the affected subdirectories without rescanning untouched folders (DEC-012).
 public final class FileSystemWatcher: @unchecked Sendable {
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "com.disksteward.fsevents", qos: .utility)
@@ -12,15 +13,28 @@ public final class FileSystemWatcher: @unchecked Sendable {
 
     private static let ignoredPathSubstrings: [String] = [
         "/.DS_Store",
+        "/.Spotlight-V100",
+        "/.fseventsd",
+        "/.Trashes",
         "/Library/Caches/DiskSteward",
         "/Application Support/DiskSteward",
-        "/System/Volumes/VM",
-        "/private/var/folders",
-        "/private/var/vm",
-        "/private/var/db",
-        "/private/var/log",
+        "/Library/Caches/com.apple.",
+        "/Library/Logs/",
+        "/System/Volumes/",
+        "/private/var/",
+        "/private/tmp/",
         "/dev/"
     ]
+
+    /// FSEvent item flags representing actual size or structure mutations (excludes pure FinderInfo/xattr/inode metadata chatter).
+    private static let meaningfulChangeMask: FSEventStreamEventFlags = FSEventStreamEventFlags(
+        kFSEventStreamEventFlagItemCreated
+            | kFSEventStreamEventFlagItemRemoved
+            | kFSEventStreamEventFlagItemRenamed
+            | kFSEventStreamEventFlagItemModified
+            | kFSEventStreamEventFlagItemCloned
+            | kFSEventStreamEventFlagMustScanSubDirs
+    )
 
     public init(onPathsChanged: @escaping @Sendable ([String]) -> Void) {
         self.onPathsChanged = onPathsChanged
@@ -61,17 +75,34 @@ public final class FileSystemWatcher: @unchecked Sendable {
                 | kFSEventStreamCreateFlagFileEvents
         )
 
-        let callback: FSEventStreamCallback = { _, clientCallBackInfo, numEvents, eventPaths, _, _ in
+        let callback: FSEventStreamCallback = { _, clientCallBackInfo, numEvents, eventPaths, eventFlags, _ in
             guard let info = clientCallBackInfo, numEvents > 0 else { return }
             let watcher = Unmanaged<FileSystemWatcher>.fromOpaque(info).takeUnretainedValue()
             let cfArray = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
             guard let rawPaths = cfArray as? [String] else { return }
 
-            let meaningful = rawPaths.filter { path in
-                for ignored in FileSystemWatcher.ignoredPathSubstrings {
-                    if path.contains(ignored) { return false }
+            var meaningful: [String] = []
+            meaningful.reserveCapacity(min(numEvents, 64))
+
+            for idx in 0..<min(numEvents, rawPaths.count) {
+                let flags = eventFlags[idx]
+                // Ignore pure metadata-only events (xattr, FinderInfo, Spotlight) that do not alter file sizes or presence.
+                guard (flags & FileSystemWatcher.meaningfulChangeMask) != 0 else { continue }
+
+                let path = rawPaths[idx]
+                // Ignore synthetic root-only "/" events so OS chatter does not trigger full-disk invalidation.
+                if path == "/" || path == "/Volumes" { continue }
+
+                var ignored = false
+                for token in FileSystemWatcher.ignoredPathSubstrings {
+                    if path.contains(token) {
+                        ignored = true
+                        break
+                    }
                 }
-                return true
+                if !ignored {
+                    meaningful.append(path)
+                }
             }
 
             if !meaningful.isEmpty {
@@ -85,7 +116,7 @@ public final class FileSystemWatcher: @unchecked Sendable {
             &context,
             cfPaths,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            1.5, // Coalesce bursts within 1.5s
+            1.2, // Coalesce rapid bursts within 1.2s
             flags
         ) {
             FSEventStreamSetDispatchQueue(stream, queue)

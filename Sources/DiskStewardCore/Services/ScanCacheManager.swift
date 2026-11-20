@@ -1,31 +1,71 @@
 import CryptoKit
 import Foundation
 
-/// Cached scan entry held in memory and optionally persisted as an LZFSE-compressed snapshot (DEC-012).
+/// Cached scan entry held in memory and persisted as an LZFSE-compressed snapshot,
+/// tracking the exact set of dirty subdirectories that changed so updates rescan ONLY changed folders (DEC-012).
 public struct CachedScanEntry: Sendable {
     public let rootPath: String
     public let result: ScanResult
     public var isDirty: Bool
-    public var dirtySamplePaths: [String]
+    /// Exact directories inside `rootPath` where filesystem mutations occurred.
+    public var dirtyDirectories: Set<String>
     public var invalidatedAt: Date?
 
     public init(
         rootPath: String,
         result: ScanResult,
         isDirty: Bool = false,
-        dirtySamplePaths: [String] = [],
+        dirtyDirectories: Set<String> = [],
         invalidatedAt: Date? = nil
     ) {
         self.rootPath = rootPath
         self.result = result
         self.isDirty = isDirty
-        self.dirtySamplePaths = dirtySamplePaths
+        self.dirtyDirectories = dirtyDirectories
         self.invalidatedAt = invalidatedAt
+    }
+
+    /// Collapses `dirtyDirectories` so if both a parent and its child are dirty, only the parent is returned.
+    public var minimalDirtyDirectories: [String] {
+        Self.collapseMinimalDirectories(Array(dirtyDirectories), rootPath: rootPath)
+    }
+
+    /// True if incremental subtree patching is practical (i.e., root itself isn't the sole dirty path and count is bounded).
+    public var canIncrementalRefresh: Bool {
+        let minimal = minimalDirtyDirectories
+        guard !minimal.isEmpty else { return false }
+        if minimal.count == 1 && minimal[0] == rootPath { return false }
+        return minimal.count <= 40
+    }
+
+    public static func collapseMinimalDirectories(_ directories: [String], rootPath: String) -> [String] {
+        let stdRoot = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        let uniqueSorted = Array(Set(directories.map { URL(fileURLWithPath: $0).standardizedFileURL.path }))
+            .filter { dir in
+                if stdRoot == "/" { return dir.hasPrefix("/") }
+                return dir == stdRoot || dir.hasPrefix(stdRoot + "/")
+            }
+            .sorted { lhs, rhs in
+                if lhs.count != rhs.count { return lhs.count < rhs.count }
+                return lhs < rhs
+            }
+
+        var minimal: [String] = []
+        for candidate in uniqueSorted {
+            let coveredByExisting = minimal.contains { existing in
+                if existing == "/" { return true }
+                return candidate == existing || candidate.hasPrefix(existing + "/")
+            }
+            if !coveredByExisting {
+                minimal.append(candidate)
+            }
+        }
+        return minimal.sorted()
     }
 }
 
-/// Manages in-memory + LZFSE-compressed on-disk storage scan caches with automatic invalidation
-/// on filesystem changes (FSEvents) or app-initiated cleanup/archiving operations (DEC-012).
+/// Manages in-memory + LZFSE-compressed on-disk storage scan caches with incremental dirty-folder
+/// tracking and O(depth) subtree splicing (DEC-012).
 public final class ScanCacheManager: @unchecked Sendable {
     private let lock = NSLock()
     private var entriesByRoot: [String: CachedScanEntry] = [:]
@@ -49,35 +89,20 @@ public final class ScanCacheManager: @unchecked Sendable {
     /// Stores a completed scan in memory and asynchronously writes a compressed LZFSE snapshot to disk.
     public func store(_ result: ScanResult, persistToDisk: Bool = true) {
         let rootPath = URL(fileURLWithPath: result.root.path).standardizedFileURL.path
-        let entry = CachedScanEntry(rootPath: rootPath, result: result, isDirty: false)
+        let entry = CachedScanEntry(rootPath: rootPath, result: result, isDirty: false, dirtyDirectories: [])
 
         lock.lock()
         entriesByRoot[rootPath] = entry
         lock.unlock()
 
         if persistToDisk && !result.wasCancelled {
-            let fileURL = diskFileURL(forRootPath: rootPath)
-            let dirURL = cacheDirectoryURL
-            DispatchQueue.global(qos: .background).async {
-                autoreleasepool {
-                    do {
-                        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-                        let encoder = JSONEncoder()
-                        encoder.dateEncodingStrategy = .secondsSince1970
-                        let raw = try encoder.encode(result)
-                        let compressed = try (raw as NSData).compressed(using: .lzfse) as Data
-                        try compressed.write(to: fileURL, options: [.atomic])
-                    } catch {
-                        // Best-effort disk cache; ignore write errors silently.
-                    }
-                }
-            }
+            persistEntryToDisk(result: result, rootPath: rootPath)
         }
     }
 
     /// Looks up a cached scan for `path`:
-    /// 1. Exact in-memory match.
-    /// 2. Subtree slice from a clean cached ancestor (e.g. querying ~/Downloads when ~ or / is already cached!).
+    /// 1. Exact in-memory match (including dirty status & dirtyDirectories for incremental refresh).
+    /// 2. Subtree slice from a cached ancestor (e.g. querying ~/Downloads when ~ or / is already cached!).
     /// 3. Compressed on-disk snapshot if present and within `maxDiskCacheAgeSeconds`.
     public func lookup(path: String, loadFromDiskIfNeeded: Bool = true) -> CachedScanEntry? {
         let stdPath = URL(fileURLWithPath: path).standardizedFileURL.path
@@ -88,17 +113,21 @@ public final class ScanCacheManager: @unchecked Sendable {
             return exact
         }
 
-        // Check if any clean cached ancestor already contains this exact folder subtree!
+        // Check if any cached ancestor already contains this exact folder subtree.
         let ancestorCandidates = entriesByRoot.values
             .filter { entry in
-                guard !entry.isDirty else { return false }
-                if entry.rootPath == "/" { return stdPath.hasPrefix("/") }
+                if entry.rootPath == "/" { return stdPath.hasPrefix("/") && !stdPath.hasPrefix("/Volumes/") }
                 return stdPath.hasPrefix(entry.rootPath + "/")
             }
             .sorted { $0.rootPath.count > $1.rootPath.count }
 
         for ancestor in ancestorCandidates {
             if let subNode = ancestor.result.root.findNode(at: stdPath), subNode.isDirectory {
+                let subDirtyDirs = Set(
+                    ancestor.dirtyDirectories.filter { dir in
+                        dir == stdPath || dir.hasPrefix(stdPath + "/") || stdPath.hasPrefix(dir + "/")
+                    }
+                )
                 let subResult = ScanResult(
                     root: subNode,
                     scannedAt: ancestor.result.scannedAt,
@@ -108,7 +137,13 @@ public final class ScanCacheManager: @unchecked Sendable {
                     wasCancelled: ancestor.result.wasCancelled,
                     issues: ancestor.result.issues.filter { $0.path == stdPath || $0.path.hasPrefix(stdPath + "/") }
                 )
-                let derived = CachedScanEntry(rootPath: stdPath, result: subResult, isDirty: false)
+                let derived = CachedScanEntry(
+                    rootPath: stdPath,
+                    result: subResult,
+                    isDirty: !subDirtyDirs.isEmpty,
+                    dirtyDirectories: subDirtyDirs,
+                    invalidatedAt: subDirtyDirs.isEmpty ? nil : ancestor.invalidatedAt
+                )
                 lock.unlock()
                 return derived
             }
@@ -119,40 +154,156 @@ public final class ScanCacheManager: @unchecked Sendable {
         return loadFromDisk(rootPath: stdPath)
     }
 
-    /// Marks any cached root affected by `changedPaths` as dirty and deletes its stale disk snapshot.
-    /// Returns the list of root paths that transitioned to dirty.
+    /// Records the exact dirty subdirectories affected by `changedPaths` on matching cached roots
+    /// so incremental refresh rescans ONLY those folders instead of the whole disk (DEC-012).
     @discardableResult
     public func invalidate(changedPaths: [String], now: Date = Date()) -> [String] {
         guard !changedPaths.isEmpty else { return [] }
-        let normalizedChanges = changedPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        let fm = FileManager.default
+
+        // Resolve each changed path to the nearest existing directory (so deleting a file marks its folder dirty,
+        // and deleting a subfolder marks its parent folder dirty).
+        let resolvedDirs: [String] = changedPaths.map { raw in
+            Self.resolveTargetDirectory(forChangedPath: raw, fileManager: fm)
+        }
 
         var affectedRoots: [String] = []
-        var diskFilesToRemove: [URL] = []
 
         lock.lock()
         for (rootPath, var entry) in entriesByRoot {
-            let matching = normalizedChanges.filter { change in
+            var matchedDirs: [String] = []
+            for dir in resolvedDirs {
                 if rootPath == "/" {
-                    // Ignore changes on other mounted external volumes under /Volumes/* when checking "/".
-                    return !change.hasPrefix("/Volumes/")
+                    if !dir.hasPrefix("/Volumes/") && dir != "/" {
+                        matchedDirs.append(dir)
+                    }
+                } else if dir == rootPath || dir.hasPrefix(rootPath + "/") {
+                    matchedDirs.append(dir)
+                } else if rootPath.hasPrefix(dir + "/") {
+                    // Ancestor of rootPath itself changed/deleted
+                    matchedDirs.append(rootPath)
                 }
-                return change == rootPath || change.hasPrefix(rootPath + "/") || rootPath.hasPrefix(change + "/")
             }
-            if !matching.isEmpty {
+
+            if !matchedDirs.isEmpty {
                 entry.isDirty = true
                 entry.invalidatedAt = now
-                entry.dirtySamplePaths = Array(Set(entry.dirtySamplePaths + matching).prefix(10))
+                for d in matchedDirs {
+                    entry.dirtyDirectories.insert(d)
+                }
+                // Collapse nested dirty paths to keep set minimal.
+                let collapsed = entry.minimalDirtyDirectories
+                entry.dirtyDirectories = Set(collapsed)
                 entriesByRoot[rootPath] = entry
                 affectedRoots.append(rootPath)
-                diskFilesToRemove.append(diskFileURL(forRootPath: rootPath))
             }
         }
         lock.unlock()
 
-        for fileURL in diskFilesToRemove {
-            try? FileManager.default.removeItem(at: fileURL)
-        }
         return affectedRoots
+    }
+
+    /// Splices freshly rescanned subtrees back into the cached root tree for `rootPath` (and any cached
+    /// ancestor trees containing those subtrees), preserving all untouched sibling folders, clearing dirty flags,
+    /// and updating LZFSE disk snapshots (DEC-012).
+    public func applyIncrementalUpdate(
+        rootPath: String,
+        updatedSubtrees: [(path: String, node: StorageNode?, addedIssues: [ScanIssue])],
+        duration: TimeInterval,
+        persistToDisk: Bool = true
+    ) -> ScanResult? {
+        let stdRoot = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        var toPersist: [(rootPath: String, result: ScanResult)] = []
+        var returnResult: ScanResult?
+
+        lock.lock()
+        // Patch every cached entry that contains stdRoot (exact match or ancestor).
+        let matchingRoots = entriesByRoot.keys.filter { key in
+            key == stdRoot || (key == "/" ? stdRoot.hasPrefix("/") && !stdRoot.hasPrefix("/Volumes/") : stdRoot.hasPrefix(key + "/"))
+        }
+
+        for key in matchingRoots {
+            guard let existing = entriesByRoot[key] else { continue }
+            var patchedRoot = existing.result.root
+            var updatedIssues = existing.result.issues
+            var cleanedDirtyDirs = existing.dirtyDirectories
+
+            for update in updatedSubtrees {
+                let stdSub = URL(fileURLWithPath: update.path).standardizedFileURL.path
+                patchedRoot = patchedRoot.replacingSubtree(at: stdSub, with: update.node)
+
+                updatedIssues.removeAll { issue in
+                    issue.path == stdSub || issue.path.hasPrefix(stdSub + "/")
+                }
+                updatedIssues.append(contentsOf: update.addedIssues)
+
+                cleanedDirtyDirs = cleanedDirtyDirs.filter { dirtyDir in
+                    !(dirtyDir == stdSub || dirtyDir.hasPrefix(stdSub + "/"))
+                }
+            }
+
+            let newResult = ScanResult(
+                root: patchedRoot,
+                scannedAt: Date(),
+                duration: duration,
+                totalFilesScanned: patchedRoot.fileCount,
+                totalDirectoriesScanned: existing.result.totalDirectoriesScanned,
+                wasCancelled: existing.result.wasCancelled,
+                issues: updatedIssues
+            )
+
+            entriesByRoot[key] = CachedScanEntry(
+                rootPath: key,
+                result: newResult,
+                isDirty: !cleanedDirtyDirs.isEmpty,
+                dirtyDirectories: cleanedDirtyDirs,
+                invalidatedAt: cleanedDirtyDirs.isEmpty ? nil : existing.invalidatedAt
+            )
+
+            if persistToDisk && !newResult.wasCancelled {
+                toPersist.append((key, newResult))
+            }
+
+            if key == stdRoot {
+                returnResult = newResult
+            } else if returnResult == nil, let sliced = patchedRoot.findNode(at: stdRoot) {
+                returnResult = ScanResult(
+                    root: sliced,
+                    scannedAt: newResult.scannedAt,
+                    duration: duration,
+                    totalFilesScanned: sliced.fileCount,
+                    totalDirectoriesScanned: 1,
+                    wasCancelled: newResult.wasCancelled,
+                    issues: updatedIssues.filter { $0.path == stdRoot || $0.path.hasPrefix(stdRoot + "/") }
+                )
+            }
+        }
+        lock.unlock()
+
+        for item in toPersist {
+            persistEntryToDisk(result: item.result, rootPath: item.rootPath)
+        }
+        return returnResult
+    }
+
+    /// Resolves any filesystem change path (existing file, existing directory, or deleted path) to the
+    /// nearest existing directory that should be incrementally rescanned.
+    public static func resolveTargetDirectory(forChangedPath rawPath: String, fileManager fm: FileManager = .default) -> String {
+        var current = URL(fileURLWithPath: rawPath).standardizedFileURL
+        var isDir: ObjCBool = false
+
+        if fm.fileExists(atPath: current.path, isDirectory: &isDir) {
+            return isDir.boolValue ? current.path : current.deletingLastPathComponent().standardizedFileURL.path
+        }
+
+        // File or folder was deleted: walk up until finding the nearest existing parent directory.
+        while current.path != "/" {
+            current = current.deletingLastPathComponent().standardizedFileURL
+            if fm.fileExists(atPath: current.path, isDirectory: &isDir), isDir.boolValue {
+                return current.path
+            }
+        }
+        return "/"
     }
 
     /// Removes a specific cached entry from both memory and disk.
@@ -180,6 +331,25 @@ public final class ScanCacheManager: @unchecked Sendable {
         return keys
     }
 
+    private func persistEntryToDisk(result: ScanResult, rootPath: String) {
+        let fileURL = diskFileURL(forRootPath: rootPath)
+        let dirURL = cacheDirectoryURL
+        DispatchQueue.global(qos: .background).async {
+            autoreleasepool {
+                do {
+                    try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+                    let encoder = JSONEncoder()
+                    encoder.dateEncodingStrategy = .secondsSince1970
+                    let raw = try encoder.encode(result)
+                    let compressed = try (raw as NSData).compressed(using: .lzfse) as Data
+                    try compressed.write(to: fileURL, options: [.atomic])
+                } catch {
+                    // Best-effort disk cache.
+                }
+            }
+        }
+    }
+
     private func loadFromDisk(rootPath: String) -> CachedScanEntry? {
         let fileURL = diskFileURL(forRootPath: rootPath)
         let fm = FileManager.default
@@ -197,7 +367,7 @@ public final class ScanCacheManager: @unchecked Sendable {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .secondsSince1970
             let scanResult = try decoder.decode(ScanResult.self, from: raw)
-            let entry = CachedScanEntry(rootPath: rootPath, result: scanResult, isDirty: false)
+            let entry = CachedScanEntry(rootPath: rootPath, result: scanResult, isDirty: false, dirtyDirectories: [])
             lock.lock()
             entriesByRoot[rootPath] = entry
             lock.unlock()

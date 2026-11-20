@@ -63,6 +63,7 @@ final class AppState: ObservableObject {
     @Published var isComputingSnapshot: Bool = false
     @Published var currentScanIsFromCache: Bool = false
     @Published var currentScanHasFSChanges: Bool = false
+    @Published var dirtyFolderCount: Int = 0
 
     // MARK: - Archiving (REQ-005)
     @Published var selectedArchiveJobID: UUID?
@@ -320,9 +321,9 @@ final class AppState: ObservableObject {
         if !forceRescan {
             // Fast synchronous in-memory & ancestor-subtree check first
             if let memHit = scanCacheManager.lookup(path: target, loadFromDiskIfNeeded: false) {
-                applyScanResult(memHit.result, fromCache: true, isDirty: memHit.isDirty)
+                applyScanResult(memHit.result, fromCache: true, isDirty: memHit.isDirty, dirtyCount: memHit.minimalDirtyDirectories.count)
                 if memHit.isDirty {
-                    startScan(path: target, backgroundRefresh: true)
+                    refreshDirtyFolders(forRoot: target)
                 }
                 return
             }
@@ -337,10 +338,10 @@ final class AppState: ObservableObject {
                     guard let self, self.selectedScanPath == target else { return }
                     if let diskHit {
                         self.isScanning = false
-                        self.applyScanResult(diskHit.result, fromCache: true, isDirty: diskHit.isDirty)
+                        self.applyScanResult(diskHit.result, fromCache: true, isDirty: diskHit.isDirty, dirtyCount: diskHit.minimalDirtyDirectories.count)
                         self.updateFileSystemWatchers()
                         if diskHit.isDirty {
-                            self.startScan(path: target, backgroundRefresh: true)
+                            self.refreshDirtyFolders(forRoot: target)
                         }
                     } else {
                         self.startScan(path: target, backgroundRefresh: false)
@@ -351,6 +352,154 @@ final class AppState: ObservableObject {
         }
 
         startScan(path: target, backgroundRefresh: false)
+    }
+
+    /// Incrementally rescans ONLY the changed directories detected by FSEvents and splices them
+    /// back into the cached root tree (never rescanning untouched folders from root, DEC-012).
+    func refreshDirtyFolders(forRoot overrideRoot: String? = nil) {
+        let rootPath = URL(fileURLWithPath: overrideRoot ?? scanResult?.root.path ?? selectedScanPath).standardizedFileURL.path
+        guard let cached = scanCacheManager.lookup(path: rootPath, loadFromDiskIfNeeded: false) else {
+            startScan(path: rootPath, backgroundRefresh: false)
+            return
+        }
+
+        let dirtyDirs = cached.minimalDirtyDirectories
+        guard !dirtyDirs.isEmpty else {
+            currentScanHasFSChanges = false
+            dirtyFolderCount = 0
+            return
+        }
+
+        // Only fall back to full root rescan if root itself is dirty or dozens of disjoint top-level trees changed.
+        guard cached.canIncrementalRefresh else {
+            startScan(path: rootPath, backgroundRefresh: true)
+            return
+        }
+
+        scanTask?.cancel()
+        isRefreshingBackgroundCache = true
+        let scanner = storageScanner
+        let cacheManager = scanCacheManager
+
+        scanTask = Task { [weak self] in
+            let start = CFAbsoluteTimeGetCurrent()
+            var updates: [(path: String, node: StorageNode?, addedIssues: [ScanIssue])] = []
+            let fm = FileManager.default
+
+            for dirPath in dirtyDirs {
+                if Task.isCancelled { break }
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: dirPath, isDirectory: &isDir), isDir.boolValue {
+                    let subRes = await scanner.scan(rootURL: URL(fileURLWithPath: dirPath), stayOnSameVolume: true)
+                    if !subRes.wasCancelled {
+                        updates.append((path: dirPath, node: subRes.root, addedIssues: subRes.issues))
+                    }
+                } else {
+                    // Directory was removed from disk -> remove from cached tree.
+                    updates.append((path: dirPath, node: nil, addedIssues: []))
+                }
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            guard !Task.isCancelled, !updates.isEmpty else {
+                await MainActor.run { [weak self] in
+                    self?.isRefreshingBackgroundCache = false
+                }
+                return
+            }
+
+            let patched = cacheManager.applyIncrementalUpdate(
+                rootPath: rootPath,
+                updatedSubtrees: updates,
+                duration: elapsed,
+                persistToDisk: true
+            )
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isRefreshingBackgroundCache = false
+                if let patched {
+                    self.applyScanResult(patched, fromCache: true, isDirty: false, dirtyCount: 0, preserveZoomIfValid: true)
+                    self.statusBanner = String(
+                        format: "Incrementally updated %d changed folder(s) in %.2fs (untouched folders kept from cache).",
+                        updates.count,
+                        elapsed
+                    )
+                }
+            }
+        }
+    }
+
+    /// Incrementally rescans ONLY the currently opened subfolder (currentZoomPath) and splices it back
+    /// into the cached root tree without rescanning any sibling folders (DEC-012).
+    func refreshCurrentFolder() {
+        guard let rootPath = scanResult?.root.path else {
+            openInExplorer(path: selectedScanPath, forceRescan: true)
+            return
+        }
+        let stdRoot = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        let targetFolder = URL(fileURLWithPath: currentZoomPath ?? stdRoot).standardizedFileURL.path
+
+        // If user is at root and there are specific dirty folders, only rescan those dirty folders!
+        if targetFolder == stdRoot {
+            if let cached = scanCacheManager.lookup(path: stdRoot, loadFromDiskIfNeeded: false),
+               cached.isDirty,
+               cached.canIncrementalRefresh {
+                refreshDirtyFolders(forRoot: stdRoot)
+                return
+            }
+            startScan(path: stdRoot, backgroundRefresh: false)
+            return
+        }
+
+        // Zoomed inside a subfolder: rescan ONLY that subfolder and splice into the cached root tree!
+        scanTask?.cancel()
+        isRefreshingBackgroundCache = true
+        let scanner = storageScanner
+        let cacheManager = scanCacheManager
+
+        scanTask = Task { [weak self] in
+            let start = CFAbsoluteTimeGetCurrent()
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            let update: (path: String, node: StorageNode?, addedIssues: [ScanIssue])
+
+            if fm.fileExists(atPath: targetFolder, isDirectory: &isDir), isDir.boolValue {
+                let subRes = await scanner.scan(rootURL: URL(fileURLWithPath: targetFolder), stayOnSameVolume: true)
+                if subRes.wasCancelled {
+                    await MainActor.run { [weak self] in self?.isRefreshingBackgroundCache = false }
+                    return
+                }
+                update = (path: targetFolder, node: subRes.root, addedIssues: subRes.issues)
+            } else {
+                update = (path: targetFolder, node: nil, addedIssues: [])
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            let patched = cacheManager.applyIncrementalUpdate(
+                rootPath: stdRoot,
+                updatedSubtrees: [update],
+                duration: elapsed,
+                persistToDisk: true
+            )
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isRefreshingBackgroundCache = false
+                if let patched {
+                    let remainingDirty = cacheManager.lookup(path: stdRoot, loadFromDiskIfNeeded: false)?.minimalDirtyDirectories.count ?? 0
+                    self.applyScanResult(
+                        patched,
+                        fromCache: true,
+                        isDirty: remainingDirty > 0,
+                        dirtyCount: remainingDirty,
+                        preserveZoomIfValid: true
+                    )
+                    let folderName = URL(fileURLWithPath: targetFolder).lastPathComponent
+                    self.statusBanner = String(format: "Updated folder '%@' in %.2fs.", folderName, elapsed)
+                }
+            }
+        }
     }
 
     func startScan(path: String? = nil, backgroundRefresh: Bool = false) {
@@ -397,16 +546,37 @@ final class AppState: ObservableObject {
         _ result: ScanResult,
         fromCache: Bool,
         isDirty: Bool,
+        dirtyCount: Int = 0,
         preserveZoomIfValid: Bool = false
     ) {
         scanResult = result
         currentScanIsFromCache = fromCache
         currentScanHasFSChanges = isDirty
+        dirtyFolderCount = dirtyCount
 
         if preserveZoomIfValid,
-           let existingZoom = currentZoomPath,
-           result.root.findNode(at: existingZoom) != nil {
-            // Keep user in the subfolder they were already viewing
+           let existingZoom = currentZoomPath {
+            if result.root.findNode(at: existingZoom) != nil {
+                // Keep user right inside the folder they were viewing
+            } else {
+                // If the zoomed folder itself was deleted, step cleanly to its nearest surviving ancestor
+                var fallback = URL(fileURLWithPath: existingZoom).deletingLastPathComponent().standardizedFileURL.path
+                while fallback.count >= result.root.path.count {
+                    if result.root.findNode(at: fallback) != nil {
+                        currentZoomPath = fallback
+                        break
+                    }
+                    let parent = URL(fileURLWithPath: fallback).deletingLastPathComponent().standardizedFileURL.path
+                    if parent == fallback {
+                        currentZoomPath = result.root.path
+                        break
+                    }
+                    fallback = parent
+                }
+                if currentZoomPath == existingZoom {
+                    currentZoomPath = result.root.path
+                }
+            }
         } else {
             currentZoomPath = result.root.path
         }
@@ -506,6 +676,7 @@ final class AppState: ObservableObject {
             let stdCurrent = URL(fileURLWithPath: currentRoot).standardizedFileURL.path
             if dirtyRoots.contains(stdCurrent) {
                 currentScanHasFSChanges = true
+                dirtyFolderCount = scanCacheManager.lookup(path: stdCurrent, loadFromDiskIfNeeded: false)?.minimalDirtyDirectories.count ?? 1
             }
         }
     }

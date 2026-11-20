@@ -79,3 +79,7 @@ User reviewed v1.0.1 and requested two improvements: (1) Replace the flat/monoto
 ### Agent · 2026-11-20
 
 User refined DEC-010 after inspecting v1.1.0: do not draw deep multi-level micro-tiles simultaneously; display strictly one level of direct folders/files at a time with clear names and sizes, repeating one level at a time when drilling into a folder.
+
+### Agent · 2026-11-20
+
+User clarified that when FSEvents detects filesystem changes (e.g. cleaning files in a folder via Finder), refreshing must NEVER rescan the entire disk from root: it must rescan only the changed directories and splice the updated subtrees back into the cached tree while preserving all untouched folders.

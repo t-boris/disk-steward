@@ -67,4 +67,58 @@ final class ScanCacheManagerTests: XCTestCase {
         XCTAssertEqual(snap.largestItems.map(\.name), ["movie.mp4", "doc.pdf"])
         XCTAssertEqual(snap.categoryBreakdown.first?.category, .videos)
     }
+
+    func testIncrementalSubtreeSpliceUpdatesOnlyChangedFolderAndPreservesUntouchedSiblings() async throws {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("DiskStewardSpliceTest-\(UUID().uuidString)")
+        let folderA = tempRoot.appendingPathComponent("FolderA")
+        let folderB = tempRoot.appendingPathComponent("FolderB")
+        try fm.createDirectory(at: folderA, withIntermediateDirectories: true)
+        try fm.createDirectory(at: folderB, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let fileA1 = folderA.appendingPathComponent("big.bin")
+        let fileA2 = folderA.appendingPathComponent("keep.bin")
+        let fileB1 = folderB.appendingPathComponent("untouched.bin")
+        try Data(repeating: 0xAA, count: 65_536).write(to: fileA1)
+        try Data(repeating: 0xBB, count: 8_192).write(to: fileA2)
+        try Data(repeating: 0xCC, count: 32_768).write(to: fileB1)
+
+        let scanner = StorageScanner()
+        let initialScan = await scanner.scan(rootURL: tempRoot)
+        let manager = ScanCacheManager(cacheDirectoryURL: cacheDir)
+        manager.store(initialScan, persistToDisk: false)
+
+        let originalFolderBRef = initialScan.root.findNode(at: folderB.standardizedFileURL.path)!
+
+        // Delete big.bin inside FolderA (simulating cleaning a folder in Finder)
+        try fm.removeItem(at: fileA1)
+        let affectedRoots = manager.invalidate(changedPaths: [fileA1.path])
+        XCTAssertEqual(affectedRoots, [tempRoot.standardizedFileURL.path])
+
+        let dirtyEntry = manager.lookup(path: tempRoot.path, loadFromDiskIfNeeded: false)!
+        XCTAssertTrue(dirtyEntry.isDirty)
+        XCTAssertEqual(dirtyEntry.minimalDirtyDirectories, [folderA.standardizedFileURL.path])
+        XCTAssertTrue(dirtyEntry.canIncrementalRefresh)
+
+        // Incrementally rescan ONLY FolderA (NOT FolderB or tempRoot!)
+        let subScan = await scanner.scan(rootURL: folderA)
+        let patched = manager.applyIncrementalUpdate(
+            rootPath: tempRoot.path,
+            updatedSubtrees: [(path: folderA.path, node: subScan.root, addedIssues: subScan.issues)],
+            duration: subScan.duration,
+            persistToDisk: false
+        )!
+
+        // FolderA size dropped, total root size dropped, FolderB is now larger than FolderA (re-sorted!),
+        // AND FolderB kept the EXACT SAME object reference (never rescanned or copied!).
+        XCTAssertLessThan(patched.root.allocatedSize, initialScan.root.allocatedSize)
+        XCTAssertEqual(patched.root.fileCount, 2)
+        XCTAssertEqual(patched.root.children.first?.name, "FolderB")
+        XCTAssertTrue(patched.root.children.first === originalFolderBRef, "Untouched sibling folder must keep exact cached reference")
+
+        let cleanEntry = manager.lookup(path: tempRoot.path, loadFromDiskIfNeeded: false)!
+        XCTAssertFalse(cleanEntry.isDirty)
+        XCTAssertTrue(cleanEntry.minimalDirtyDirectories.isEmpty)
+    }
 }

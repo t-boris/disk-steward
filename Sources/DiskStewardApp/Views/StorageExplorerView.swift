@@ -163,6 +163,10 @@ struct StorageExplorerView: View {
                     }
                 }
                 Divider()
+                Button("Full Rescan from Root") {
+                    hoveredNode = nil
+                    appState.openInExplorer(path: appState.selectedScanPath, forceRescan: true)
+                }
                 Button("Clear Scan Cache") {
                     appState.clearScanCache()
                 }
@@ -187,24 +191,38 @@ struct StorageExplorerView: View {
                 .buttonStyle(.bordered)
                 .tint(.red)
             } else {
+                let isZoomedIn = appState.breadcrumbNodes.count > 1
                 Button {
                     hoveredNode = nil
-                    appState.openInExplorer(path: appState.selectedScanPath, forceRescan: true)
+                    if appState.scanResult == nil {
+                        appState.openInExplorer(path: appState.selectedScanPath, forceRescan: false)
+                    } else {
+                        appState.refreshCurrentFolder()
+                    }
                 } label: {
-                    Label(appState.scanResult == nil ? "Scan" : "Rescan", systemImage: "arrow.clockwise")
+                    Label(
+                        appState.scanResult == nil ? "Scan" : (isZoomedIn ? "Refresh Folder" : "Refresh"),
+                        systemImage: "arrow.clockwise"
+                    )
                 }
                 .buttonStyle(.borderedProminent)
+                .help(isZoomedIn
+                    ? "Rescan only the currently open folder and splice it into the cached tree"
+                    : "Incrementally update changed folders (use the folder menu for Full Rescan from Root)")
             }
 
             // Live FSEvents cache status indicator (DEC-012)
             if appState.scanResult != nil && !appState.isScanning {
                 if appState.currentScanHasFSChanges {
                     Button {
-                        appState.openInExplorer(path: appState.selectedScanPath, forceRescan: true)
+                        appState.refreshDirtyFolders()
                     } label: {
                         HStack(spacing: 5) {
                             Circle().fill(Color.orange).frame(width: 7, height: 7)
-                            Text("Files changed • Refresh")
+                            let label = appState.dirtyFolderCount > 0
+                                ? "\(appState.dirtyFolderCount) folder(s) changed • Update"
+                                : "Files changed • Update"
+                            Text(label)
                                 .font(.caption.weight(.medium))
                         }
                         .padding(.horizontal, 8)
@@ -213,7 +231,7 @@ struct StorageExplorerView: View {
                         .clipShape(Capsule())
                     }
                     .buttonStyle(.plain)
-                    .help("FSEvents detected filesystem changes since this scan; click to refresh")
+                    .help("Incrementally rescan ONLY the changed folder(s) and keep untouched folders cached")
                 } else {
                     HStack(spacing: 5) {
                         Circle().fill(Color.green).frame(width: 7, height: 7)

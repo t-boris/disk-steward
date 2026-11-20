@@ -325,6 +325,105 @@ public final class StorageNode: Identifiable, Hashable, Codable, @unchecked Send
         }
         return nil
     }
+
+    /// Returns a new tree with the node at `targetPath` replaced by `replacement` (or removed if `replacement == nil`),
+    /// touching ONLY the O(depth) ancestor chain and preserving all untouched sibling StorageNode references intact (DEC-012).
+    public func replacingSubtree(at targetPath: String, with replacement: StorageNode?) -> StorageNode {
+        let stdTarget = URL(fileURLWithPath: targetPath).standardizedFileURL.path
+        let stdSelf = URL(fileURLWithPath: path).standardizedFileURL.path
+
+        if stdSelf == stdTarget {
+            return replacement ?? StorageNode(
+                id: id,
+                name: name,
+                path: path,
+                isDirectory: isDirectory,
+                allocatedSize: 0,
+                logicalSize: 0,
+                fileCount: 0,
+                modifiedDate: Date(),
+                category: category,
+                children: [],
+                hasInaccessibleDescendants: false
+            )
+        }
+
+        // Only descend if targetPath lies inside this directory.
+        let isAncestor = (stdSelf == "/") ? stdTarget.hasPrefix("/") : stdTarget.hasPrefix(stdSelf + "/")
+        guard isDirectory && isAncestor else { return self }
+
+        var newChildren = children
+        var modified = false
+
+        // Check if target is a direct child first.
+        if let directIdx = newChildren.firstIndex(where: { URL(fileURLWithPath: $0.path).standardizedFileURL.path == stdTarget }) {
+            if let replacement {
+                newChildren[directIdx] = replacement
+            } else {
+                newChildren.remove(at: directIdx)
+            }
+            modified = true
+        } else {
+            // Check if target lies inside one of our child directories.
+            for idx in newChildren.indices where newChildren[idx].isDirectory {
+                let childStd = URL(fileURLWithPath: newChildren[idx].path).standardizedFileURL.path
+                if stdTarget.hasPrefix(childStd + "/") {
+                    let updatedChild = newChildren[idx].replacingSubtree(at: stdTarget, with: replacement)
+                    if updatedChild !== newChildren[idx] {
+                        newChildren[idx] = updatedChild
+                        modified = true
+                    }
+                    break
+                }
+            }
+
+            // If target was a newly created direct child directory/file inside stdSelf, insert it!
+            if !modified, let replacement {
+                let parentOfTarget = URL(fileURLWithPath: stdTarget).deletingLastPathComponent().standardizedFileURL.path
+                if parentOfTarget == stdSelf {
+                    newChildren.append(replacement)
+                    modified = true
+                }
+            }
+        }
+
+        guard modified else { return self }
+
+        newChildren.sort { lhs, rhs in
+            if lhs.allocatedSize != rhs.allocatedSize {
+                return lhs.allocatedSize > rhs.allocatedSize
+            }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+
+        var totalAllocated: Int64 = 0
+        var totalLogical: Int64 = 0
+        var totalFiles = 0
+        var latestMod = Date.distantPast
+        var hasInaccessible = false
+
+        for child in newChildren {
+            totalAllocated += child.allocatedSize
+            totalLogical += child.logicalSize
+            totalFiles += child.fileCount
+            if child.modifiedDate > latestMod { latestMod = child.modifiedDate }
+            if child.hasInaccessibleDescendants { hasInaccessible = true }
+        }
+
+        return StorageNode(
+            id: id,
+            name: name,
+            path: path,
+            isDirectory: true,
+            allocatedSize: totalAllocated,
+            logicalSize: totalLogical,
+            fileCount: totalFiles,
+            modifiedDate: latestMod == Date.distantPast ? modifiedDate : latestMod,
+            category: category,
+            children: newChildren,
+            hasInaccessibleDescendants: hasInaccessible
+        )
+    }
 }
 
 /// Complete or partial result of scanning a disk or folder.
