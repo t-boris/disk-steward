@@ -75,3 +75,7 @@ User confirmed implementation policies prior to coding: (1) Confirmed deletion d
 ### Agent · 2026-11-20
 
 User reviewed v1.0.1 and requested two improvements: (1) Replace the flat/monotone treemap and color-mode toggle with a true deep nested structural treemap sized strictly by bytes using vivid contrasting colors for adjacent rectangles, plus quick single-focus category filtering inside any drilled-down folder (DEC-010). (2) Add rule-based folder cleanup allowing the user to target any folder and recursively find/remove matching files by category (e.g. code, videos, archives), extensions (e.g. zip), filename, or age, with confirmation (DEC-011).
+
+### Agent · 2026-11-20
+
+User refined DEC-010 after inspecting v1.1.0: do not draw deep multi-level micro-tiles simultaneously; display strictly one level of direct folders/files at a time with clear names and sizes, repeating one level at a time when drilling into a folder.

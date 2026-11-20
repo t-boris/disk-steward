@@ -3,8 +3,8 @@ import Foundation
 /// Provides the current application version from the app bundle Info.plist,
 /// falling back to the embedded semantic version when running from SwiftPM/CLI.
 public enum DiskStewardVersion {
-    public static let fallbackVersion = "1.1.0"
-    public static let fallbackBuild = "6"
+    public static let fallbackVersion = "1.1.1"
+    public static let fallbackBuild = "7"
 
     public static var current: String {
         if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,

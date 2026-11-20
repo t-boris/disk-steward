@@ -429,7 +429,7 @@ struct StorageExplorerView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                Text("Nested rectangles are sized strictly by allocated disk space. Click any folder to zoom in; right-click to clean by rule or reveal in Finder.")
+                Text("Showing direct folders and files sized strictly by disk usage. Click any folder to drill in one level; right-click to clean by rule or reveal in Finder.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

@@ -2,9 +2,9 @@ import AppKit
 import DiskStewardCore
 import SwiftUI
 
-/// High-performance multi-level structural treemap rendered via SwiftUI Canvas (REQ-003, DEC-010).
-/// Every nested rectangle is sized strictly proportionally to allocated bytes and colored with
-/// vivid contrasting colors so adjacent folders and files stand apart clearly.
+/// Clean single-level-per-view structural treemap rendered via SwiftUI Canvas (REQ-003, DEC-010).
+/// Shows only the direct folders and files of the active scope sized strictly proportionally to allocated bytes,
+/// with high-contrast colors between adjacent tiles and drill-down into any folder.
 struct TreemapView: View {
     let scopeNode: StorageNode
     let selectedNodeID: String?
@@ -32,15 +32,15 @@ struct TreemapView: View {
                     context.fill(Path(bgRect), with: .color(Color(nsColor: .underPageBackgroundColor)))
 
                     for tile in tiles {
-                        drawTile(tile, in: &context)
+                        drawTile(tile, isHovered: tile.id == hoveredTileID, in: &context)
                     }
 
-                    // Highlight currently selected or hovered tile on top
+                    // Crisp highlight border on selected or hovered tile
                     if let selectedID = selectedNodeID,
-                       let sel = tiles.last(where: { $0.node.id == selectedID }) {
-                        let r = cgRect(sel.rect).insetBy(dx: 1, dy: 1)
+                       let sel = tiles.first(where: { $0.node.id == selectedID }) {
+                        let r = cgRect(sel.rect).insetBy(dx: 2, dy: 2)
                         context.stroke(
-                            Path(roundedRect: r, cornerRadius: 3),
+                            Path(roundedRect: r, cornerRadius: 6),
                             with: .color(.white),
                             lineWidth: 2.5
                         )
@@ -48,11 +48,11 @@ struct TreemapView: View {
 
                     if let hovID = hoveredTileID,
                        let hov = tiles.first(where: { $0.id == hovID }) {
-                        let r = cgRect(hov.rect).insetBy(dx: 0.75, dy: 0.75)
+                        let r = cgRect(hov.rect).insetBy(dx: 1.5, dy: 1.5)
                         context.stroke(
-                            Path(roundedRect: r, cornerRadius: 3),
+                            Path(roundedRect: r, cornerRadius: 6),
                             with: .color(.white.opacity(0.95)),
-                            lineWidth: 2.0
+                            lineWidth: 2.2
                         )
                     }
                 }
@@ -85,7 +85,7 @@ struct TreemapView: View {
                 .contextMenu {
                     if let target = hoveredTileNode {
                         if target.isDirectory {
-                            Button("Open Folder in Treemap") {
+                            Button("Open Folder") {
                                 onDrillDown(target)
                             }
                             Button("Clean This Folder by Rule…") {
@@ -109,7 +109,7 @@ struct TreemapView: View {
                         Image(systemName: "square.grid.2x2")
                             .font(.largeTitle)
                             .foregroundStyle(.secondary)
-                        Text("No matching files with allocated size in this scope.")
+                        Text("No matching files with allocated size in this folder.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -138,6 +138,15 @@ struct TreemapView: View {
         }
     }
 
+    private func computeSingleLevelTiles(for size: CGSize) -> [NestedTreemapTile] {
+        TreemapLayout.computeNested(
+            scope: scopeNode,
+            in: TreemapRect(x: 0, y: 0, width: Double(size.width), height: Double(size.height)),
+            maxDepth: 0,
+            maxItemsPerLevel: 50
+        )
+    }
+
     private func currentTiles(for size: CGSize) -> [NestedTreemapTile] {
         if cachedSize == size
             && cachedScopeID == scopeNode.id
@@ -145,12 +154,7 @@ struct TreemapView: View {
             && cachedScopeFiles == scopeNode.fileCount {
             return cachedTiles
         }
-        return TreemapLayout.computeNested(
-            scope: scopeNode,
-            in: TreemapRect(x: 0, y: 0, width: Double(size.width), height: Double(size.height)),
-            maxDepth: 4,
-            maxItemsPerLevel: 50
-        )
+        return computeSingleLevelTiles(for: size)
     }
 
     private func recomputeCache(size: CGSize) {
@@ -159,20 +163,13 @@ struct TreemapView: View {
         cachedScopeID = scopeNode.id
         cachedScopeBytes = scopeNode.allocatedSize
         cachedScopeFiles = scopeNode.fileCount
-        cachedTiles = TreemapLayout.computeNested(
-            scope: scopeNode,
-            in: TreemapRect(x: 0, y: 0, width: Double(size.width), height: Double(size.height)),
-            maxDepth: 4,
-            maxItemsPerLevel: 50
-        )
+        cachedTiles = computeSingleLevelTiles(for: size)
     }
 
-    /// Hit-tests deepest (most specific) tile under cursor, preferring folder header clicks for container folders.
     private func hitTest(at point: CGPoint, in tiles: [NestedTreemapTile]) -> NestedTreemapTile? {
         let px = Double(point.x)
         let py = Double(point.y)
-        // Reverse painter's order checks deepest children first.
-        for tile in tiles.reversed() {
+        for tile in tiles {
             if tile.rect.contains(x: px, y: py) {
                 return tile
             }
@@ -180,89 +177,87 @@ struct TreemapView: View {
         return nil
     }
 
-    private func drawTile(_ tile: NestedTreemapTile, in context: inout GraphicsContext) {
-        let gap: CGFloat = tile.depth == 0 ? 1.0 : 0.6
-        let rect = cgRect(tile.rect).insetBy(dx: gap, dy: gap)
+    private func drawTile(_ tile: NestedTreemapTile, isHovered: Bool, in context: inout GraphicsContext) {
+        let rect = cgRect(tile.rect).insetBy(dx: 1.75, dy: 1.75)
         guard rect.width >= 1, rect.height >= 1 else { return }
 
-        let corner: CGFloat = tile.depth == 0 ? 4 : 2
+        let corner: CGFloat = min(6, min(rect.width, rect.height) * 0.25)
         let shape = Path(roundedRect: rect, cornerRadius: corner)
 
         let baseColor: Color = tile.isAggregatedRemainder
-            ? Color(red: 0.42, green: 0.45, blue: 0.50)
+            ? Color(red: 0.40, green: 0.43, blue: 0.48)
             : tile.color.swiftUIColor
 
-        // Cushion shading: deeper nested folders get slightly richer framing, leaf tiles get a subtle 3D cushion gradient.
-        if tile.hasRenderedChildren {
-            // Folder frame container (darker saturated header/frame so nested children inside pop cleanly)
-            context.fill(shape, with: .color(baseColor.opacity(0.88)))
-            context.fill(shape, with: .color(Color.black.opacity(0.26)))
-            context.stroke(shape, with: .color(Color.black.opacity(0.45)), lineWidth: tile.depth == 0 ? 1.4 : 0.9)
-
-            // Draw crisp folder header label
-            if let hRect = tile.headerRect {
-                let headerCG = cgRect(hRect)
-                if headerCG.width >= 44 && headerCG.height >= 11 {
-                    let sizeStr = ByteFormatting.string(from: tile.node.allocatedSize)
-                    let labelStr = headerCG.width >= 135 ? "▸ \(tile.node.name)  (\(sizeStr))" : tile.node.name
-                    let fontSize: CGFloat = tile.depth == 0 ? 10.5 : 9.0
-                    let text = Text(labelStr)
-                        .font(.system(size: fontSize, weight: .semibold))
-                        .foregroundStyle(Color.white)
-                    let resolved = context.resolve(text)
-                    context.drawLayer { layer in
-                        layer.clip(to: Path(headerCG))
-                        layer.draw(
-                            resolved,
-                            at: CGPoint(x: headerCG.minX + 4, y: headerCG.midY),
-                            anchor: .leading
-                        )
-                    }
-                }
-            }
-        } else {
-            // Leaf file or unexpanded compact folder tile: vivid cushion fill
-            let lightHighlight = Color.white.opacity(0.20)
-            let darkShade = Color.black.opacity(0.22)
-            context.fill(shape, with: .color(baseColor))
-            context.fill(
-                shape,
-                with: .linearGradient(
-                    Gradient(colors: [lightHighlight, .clear, darkShade]),
-                    startPoint: CGPoint(x: rect.minX, y: rect.minY),
-                    endPoint: CGPoint(x: rect.maxX, y: rect.maxY)
-                )
+        // Vivid solid tile with gentle cushion lighting
+        context.fill(shape, with: .color(baseColor))
+        context.fill(
+            shape,
+            with: .linearGradient(
+                Gradient(colors: [
+                    Color.white.opacity(isHovered ? 0.26 : 0.16),
+                    Color.clear,
+                    Color.black.opacity(0.22)
+                ]),
+                startPoint: CGPoint(x: rect.minX, y: rect.minY),
+                endPoint: CGPoint(x: rect.maxX, y: rect.maxY)
             )
-            context.stroke(shape, with: .color(Color.black.opacity(0.30)), lineWidth: 0.75)
+        )
+        context.stroke(shape, with: .color(Color.black.opacity(0.28)), lineWidth: 0.85)
 
-            // Label inside tile when there is enough room
-            if rect.width >= 48 && rect.height >= 16 {
-                let prefix = tile.node.isDirectory ? "📁 " : ""
-                let titleText = Text("\(prefix)\(tile.node.name)")
-                    .font(.system(size: rect.width >= 100 ? 10.5 : 9.0, weight: .semibold))
-                    .foregroundStyle(Color.white)
-                let resolvedTitle = context.resolve(titleText)
+        // Adaptive crisp typography sized to the rectangle so folder names and sizes are instantly scannable
+        guard rect.width >= 44 && rect.height >= 20 else { return }
 
-                context.drawLayer { layer in
-                    layer.clip(to: Path(rect.insetBy(dx: 3, dy: 2)))
+        let isLarge = rect.width >= 150 && rect.height >= 76
+        let isMedium = rect.width >= 88 && rect.height >= 44
+
+        let titleFontSize: CGFloat = isLarge ? 14.5 : (isMedium ? 12.0 : 10.0)
+        let sizeFontSize: CGFloat = isLarge ? 12.5 : (isMedium ? 10.5 : 9.0)
+        let metaFontSize: CGFloat = isLarge ? 10.5 : 9.0
+        let insetX: CGFloat = isLarge ? 10 : 6
+        let insetY: CGFloat = isLarge ? 8 : 4
+
+        let prefix = (tile.node.isDirectory && !tile.isAggregatedRemainder) ? "▸ " : ""
+        let titleText = Text("\(prefix)\(tile.node.name)")
+            .font(.system(size: titleFontSize, weight: .bold))
+            .foregroundStyle(Color.white)
+        let resolvedTitle = context.resolve(titleText)
+
+        context.drawLayer { layer in
+            layer.clip(to: Path(rect.insetBy(dx: 4, dy: 3)))
+            layer.draw(
+                resolvedTitle,
+                at: CGPoint(x: rect.minX + insetX, y: rect.minY + insetY),
+                anchor: .topLeading
+            )
+
+            let sizeY = rect.minY + insetY + titleFontSize + (isLarge ? 5 : 3)
+            if rect.height >= (isLarge ? 54 : 34) && rect.width >= 58 {
+                let sizeStr = ByteFormatting.string(from: tile.node.allocatedSize)
+                let pctStr = ByteFormatting.percentString(tile.fractionOfScope)
+                let sizeLabel = rect.width >= 120 ? "\(sizeStr)  (\(pctStr))" : sizeStr
+                let sizeText = Text(sizeLabel)
+                    .font(.system(size: sizeFontSize, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(Color.white.opacity(0.95))
+                let resolvedSize = layer.resolve(sizeText)
+                layer.draw(
+                    resolvedSize,
+                    at: CGPoint(x: rect.minX + insetX, y: sizeY),
+                    anchor: .topLeading
+                )
+
+                if isLarge && rect.height >= 88 && !tile.isAggregatedRemainder {
+                    let metaStr = tile.node.isDirectory
+                        ? "\(tile.node.fileCount.formatted()) file(s) • click to open"
+                        : tile.node.category.displayName
+                    let metaText = Text(metaStr)
+                        .font(.system(size: metaFontSize, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.78))
+                    let resolvedMeta = layer.resolve(metaText)
                     layer.draw(
-                        resolvedTitle,
-                        at: CGPoint(x: rect.minX + 4, y: rect.minY + 3),
+                        resolvedMeta,
+                        at: CGPoint(x: rect.minX + insetX, y: sizeY + sizeFontSize + 5),
                         anchor: .topLeading
                     )
-
-                    if rect.height >= 31 && rect.width >= 56 {
-                        let sizeLabel = "\(ByteFormatting.string(from: tile.node.allocatedSize))"
-                        let subText = Text(sizeLabel)
-                            .font(.system(size: 9.0, weight: .regular).monospacedDigit())
-                            .foregroundStyle(Color.white.opacity(0.90))
-                        let resolvedSub = layer.resolve(subText)
-                        layer.draw(
-                            resolvedSub,
-                            at: CGPoint(x: rect.minX + 4, y: rect.minY + 16),
-                            anchor: .topLeading
-                        )
-                    }
                 }
             }
         }

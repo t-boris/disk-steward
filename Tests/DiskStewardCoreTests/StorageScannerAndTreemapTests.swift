@@ -178,6 +178,12 @@ final class StorageScannerAndTreemapTests: XCTestCase {
         }
         XCTAssertNotEqual(videoChildren[0].colorIndex, videoChildren[1].colorIndex)
 
+        // Single-level mode (maxDepth: 0) renders strictly immediate children with distinct contrasting colors (DEC-010).
+        let singleLevel = TreemapLayout.computeNested(scope: root, in: bounds, maxDepth: 0)
+        XCTAssertEqual(singleLevel.count, 2)
+        XCTAssertTrue(singleLevel.allSatisfy { $0.depth == 0 && !$0.hasRenderedChildren })
+        XCTAssertNotEqual(singleLevel[0].colorIndex, singleLevel[1].colorIndex)
+
         // Custom extension filter narrows scope cleanly.
         let zipFilter = StorageFilter(customExtensions: ["zip"])
         let filtered = StorageAnalyzer.filteredTree(root, filter: zipFilter, relativeTo: now)
