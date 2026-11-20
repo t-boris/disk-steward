@@ -50,15 +50,19 @@ final class AppState: ObservableObject {
     @Published var volumes: [DiskVolume] = []
     @Published var lastVolumeRefresh: Date?
 
-    // MARK: - Storage Explorer (REQ-003, REQ-004, DEC-010)
+    // MARK: - Storage Explorer (REQ-003, REQ-004, DEC-010, DEC-012)
     @Published var selectedScanPath: String
     @Published var isScanning: Bool = false
+    @Published var isRefreshingBackgroundCache: Bool = false
     @Published var scanProgress: ScanProgress?
     @Published var scanResult: ScanResult?
     @Published var currentZoomPath: String?
     @Published var storageFilter: StorageFilter = StorageFilter()
     @Published var selectedNodeID: String?
-    @Published var hoveredNode: StorageNode?
+    @Published var explorerSnapshot: ExplorerSnapshot?
+    @Published var isComputingSnapshot: Bool = false
+    @Published var currentScanIsFromCache: Bool = false
+    @Published var currentScanHasFSChanges: Bool = false
 
     // MARK: - Archiving (REQ-005)
     @Published var selectedArchiveJobID: UUID?
@@ -85,11 +89,21 @@ final class AppState: ObservableObject {
     private let configStore: ConfigurationStore
     private let volumeMonitor: VolumeMonitor
     private let storageScanner: StorageScanner
+    private let scanCacheManager: ScanCacheManager
+    private var fsWatcher: FileSystemWatcher?
     private let archiveRuleEngine: ArchiveRuleEngine
     private let archiveExecutor: ArchiveExecutor
     private let archiveScheduler: ArchiveScheduler
     private let cleanupScanner: CleanupScanner
     private let cleanupExecutor: CleanupExecutor
+
+    private struct SnapshotCacheKey: Hashable {
+        let scanTimestamp: TimeInterval
+        let zoomPath: String
+        let filter: StorageFilter
+    }
+    private var explorerSnapshotCache: [SnapshotCacheKey: ExplorerSnapshot] = [:]
+    private var snapshotGeneration: UInt64 = 0
 
     private var scanTask: Task<Void, Never>?
     private var archiveTask: Task<ArchiveExecutionOutput, Never>?
@@ -124,11 +138,18 @@ final class AppState: ObservableObject {
             + loaded.configuration.archiveJobs.flatMap(\.configuredDestinations)
         self.volumeMonitor = VolumeMonitor(trackedPaths: tracked)
         self.storageScanner = StorageScanner()
+        self.scanCacheManager = ScanCacheManager()
         self.archiveRuleEngine = ArchiveRuleEngine()
         self.archiveExecutor = ArchiveExecutor(ruleEngine: ArchiveRuleEngine())
         self.archiveScheduler = ArchiveScheduler()
         self.cleanupScanner = CleanupScanner()
         self.cleanupExecutor = CleanupExecutor()
+
+        self.fsWatcher = FileSystemWatcher { [weak self] changedPaths in
+            Task { @MainActor [weak self] in
+                self?.handleFileSystemChanges(changedPaths)
+            }
+        }
 
         refreshVolumes()
         startMonitoringTimers()
@@ -174,17 +195,6 @@ final class AppState: ObservableObject {
 
     var cleanupCandidateCount: Int {
         cleanupProposal?.candidates.count ?? 0
-    }
-
-    var activeScopeNode: StorageNode? {
-        guard let root = scanResult?.root else { return nil }
-        let baseNode: StorageNode
-        if let zoom = currentZoomPath, let zoomed = root.findNode(at: zoom) {
-            baseNode = zoomed
-        } else {
-            baseNode = root
-        }
-        return StorageAnalyzer.filteredTree(baseNode, filter: storageFilter)
     }
 
     var unfilteredScopeNode: StorageNode? {
@@ -295,34 +305,207 @@ final class AppState: ObservableObject {
         workspaceObservers = [mountObserver, unmountObserver]
     }
 
-    // MARK: - Storage Scanning & Exploration (REQ-003, REQ-004)
+    // MARK: - Storage Scanning, Caching & FSEvents Exploration (REQ-003, REQ-004, DEC-012)
 
-    func startScan(path: String? = nil) {
-        let target = path ?? selectedScanPath
+    /// Opens `path` in Storage Explorer using the cache whenever available and clean:
+    /// - Clean cache hit (memory, ancestor subtree, or LZFSE disk snapshot): displays instantaneously without rescanning.
+    /// - Dirty cache hit (FSEvents detected filesystem changes): displays cached data immediately and refreshes in background.
+    /// - Cache miss or `forceRescan == true`: runs fast parallel POSIX scan and caches result + starts FSEvents watcher.
+    func openInExplorer(path: String? = nil, forceRescan: Bool = false) {
+        let rawTarget = path ?? selectedScanPath
+        let target = URL(fileURLWithPath: rawTarget).standardizedFileURL.path
+        selectedScanPath = target
+        statusBanner = nil
+
+        if !forceRescan {
+            // Fast synchronous in-memory & ancestor-subtree check first
+            if let memHit = scanCacheManager.lookup(path: target, loadFromDiskIfNeeded: false) {
+                applyScanResult(memHit.result, fromCache: true, isDirty: memHit.isDirty)
+                if memHit.isDirty {
+                    startScan(path: target, backgroundRefresh: true)
+                }
+                return
+            }
+
+            // Check LZFSE compressed disk snapshot off-main-thread before launching a full scan
+            let cacheManager = scanCacheManager
+            isScanning = true
+            scanProgress = nil
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let diskHit = cacheManager.lookup(path: target, loadFromDiskIfNeeded: true)
+                DispatchQueue.main.async {
+                    guard let self, self.selectedScanPath == target else { return }
+                    if let diskHit {
+                        self.isScanning = false
+                        self.applyScanResult(diskHit.result, fromCache: true, isDirty: diskHit.isDirty)
+                        self.updateFileSystemWatchers()
+                        if diskHit.isDirty {
+                            self.startScan(path: target, backgroundRefresh: true)
+                        }
+                    } else {
+                        self.startScan(path: target, backgroundRefresh: false)
+                    }
+                }
+            }
+            return
+        }
+
+        startScan(path: target, backgroundRefresh: false)
+    }
+
+    func startScan(path: String? = nil, backgroundRefresh: Bool = false) {
+        let rawTarget = path ?? selectedScanPath
+        let target = URL(fileURLWithPath: rawTarget).standardizedFileURL.path
         selectedScanPath = target
         scanTask?.cancel()
-        isScanning = true
-        scanProgress = nil
-        currentZoomPath = nil
-        selectedNodeID = nil
-        hoveredNode = nil
+
+        if backgroundRefresh {
+            isRefreshingBackgroundCache = true
+        } else {
+            isScanning = true
+            scanProgress = nil
+            selectedNodeID = nil
+        }
         statusBanner = nil
 
         let scanner = storageScanner
+        let cacheManager = scanCacheManager
         let url = URL(fileURLWithPath: target)
         let onProgress: @Sendable (ScanProgress) -> Void = { [weak self] progress in
             Task { @MainActor in
                 self?.scanProgress = progress
             }
         }
-        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+
+        scanTask = Task { [weak self] in
             let result = await scanner.scan(rootURL: url, stayOnSameVolume: true, progressHandler: onProgress)
+            if !result.wasCancelled {
+                cacheManager.store(result, persistToDisk: true)
+            }
             await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.scanResult = result
-                self.currentZoomPath = result.root.path
+                guard let self, self.selectedScanPath == target else { return }
                 self.isScanning = false
+                self.isRefreshingBackgroundCache = false
                 self.scanProgress = nil
+                self.applyScanResult(result, fromCache: false, isDirty: false, preserveZoomIfValid: backgroundRefresh)
+                self.updateFileSystemWatchers()
+            }
+        }
+    }
+
+    private func applyScanResult(
+        _ result: ScanResult,
+        fromCache: Bool,
+        isDirty: Bool,
+        preserveZoomIfValid: Bool = false
+    ) {
+        scanResult = result
+        currentScanIsFromCache = fromCache
+        currentScanHasFSChanges = isDirty
+
+        if preserveZoomIfValid,
+           let existingZoom = currentZoomPath,
+           result.root.findNode(at: existingZoom) != nil {
+            // Keep user in the subfolder they were already viewing
+        } else {
+            currentZoomPath = result.root.path
+        }
+        selectedNodeID = nil
+        explorerSnapshotCache.removeAll()
+        refreshExplorerSnapshot()
+    }
+
+    /// Recomputes ExplorerSnapshot off the Main Thread with instant cache hit when revisiting folders or filters (DEC-012).
+    func refreshExplorerSnapshot() {
+        guard let result = scanResult, let scope = unfilteredScopeNode else {
+            explorerSnapshot = nil
+            isComputingSnapshot = false
+            return
+        }
+
+        let key = SnapshotCacheKey(
+            scanTimestamp: result.scannedAt.timeIntervalSinceReferenceDate,
+            zoomPath: scope.path,
+            filter: storageFilter
+        )
+        if let cached = explorerSnapshotCache[key] {
+            explorerSnapshot = cached
+            isComputingSnapshot = false
+            return
+        }
+
+        // Fast optimistic update for unfiltered drill-down so Treemap updates on the EXACT click frame (0ms)!
+        if !storageFilter.isActive {
+            explorerSnapshot = ExplorerSnapshot(
+                scopePath: scope.path,
+                scopeName: scope.name,
+                scopeAllocatedBytes: scope.allocatedSize,
+                scopeFileCount: scope.fileCount,
+                directChildren: scope.children,
+                largestItems: explorerSnapshot?.largestItems ?? [],
+                categoryBreakdown: explorerSnapshot?.categoryBreakdown ?? [],
+                ageBreakdown: explorerSnapshot?.ageBreakdown ?? [],
+                isEmptyDueToFilter: false
+            )
+        }
+
+        snapshotGeneration &+= 1
+        let expectedGen = snapshotGeneration
+        let activeFilter = storageFilter
+        isComputingSnapshot = true
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let snapshot = StorageAnalyzer.buildSnapshot(for: scope, filter: activeFilter, largestLimit: 150)
+            DispatchQueue.main.async {
+                guard let self, self.snapshotGeneration == expectedGen else { return }
+                if self.explorerSnapshotCache.count > 64 {
+                    self.explorerSnapshotCache.removeAll()
+                }
+                self.explorerSnapshotCache[key] = snapshot
+                self.explorerSnapshot = snapshot
+                self.isComputingSnapshot = false
+            }
+        }
+    }
+
+    /// Loads an existing LZFSE disk cache snapshot for `selectedScanPath` on first view appear without launching a scan.
+    func loadCachedExplorerIfAvailable() {
+        guard scanResult == nil, !isScanning else { return }
+        let target = URL(fileURLWithPath: selectedScanPath).standardizedFileURL.path
+        let cacheManager = scanCacheManager
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let hit = cacheManager.lookup(path: target, loadFromDiskIfNeeded: true)
+            DispatchQueue.main.async {
+                guard let self, self.scanResult == nil, !self.isScanning, self.selectedScanPath == target else { return }
+                if let hit {
+                    self.applyScanResult(hit.result, fromCache: true, isDirty: hit.isDirty)
+                    self.updateFileSystemWatchers()
+                }
+            }
+        }
+    }
+
+    func clearScanCache() {
+        scanCacheManager.clearAll()
+        explorerSnapshotCache.removeAll()
+        fsWatcher?.stop()
+        currentScanIsFromCache = false
+        currentScanHasFSChanges = false
+        statusBanner = "Cleared storage scan cache."
+    }
+
+    private func updateFileSystemWatchers() {
+        let roots = scanCacheManager.cachedRootPaths
+        fsWatcher?.watch(paths: roots)
+    }
+
+    private func handleFileSystemChanges(_ changedPaths: [String]) {
+        let dirtyRoots = scanCacheManager.invalidate(changedPaths: changedPaths)
+        guard !dirtyRoots.isEmpty else { return }
+        if let currentRoot = scanResult?.root.path {
+            let stdCurrent = URL(fileURLWithPath: currentRoot).standardizedFileURL.path
+            if dirtyRoots.contains(stdCurrent) {
+                currentScanHasFSChanges = true
             }
         }
     }
@@ -330,12 +513,13 @@ final class AppState: ObservableObject {
     func cancelScan() {
         scanTask?.cancel()
         isScanning = false
+        isRefreshingBackgroundCache = false
     }
 
     func exploreVolume(_ volume: DiskVolume) {
         guard volume.isConnected else { return }
         selectedSection = .explorer
-        startScan(path: volume.mountPath)
+        openInExplorer(path: volume.mountPath, forceRescan: false)
     }
 
     func drillDown(to node: StorageNode) {
@@ -345,11 +529,13 @@ final class AppState: ObservableObject {
         }
         currentZoomPath = node.path
         selectedNodeID = nil
+        refreshExplorerSnapshot()
     }
 
     func navigateBreadcrumb(to node: StorageNode) {
         currentZoomPath = node.path
         selectedNodeID = nil
+        refreshExplorerSnapshot()
     }
 
     func navigateUp() {
@@ -357,10 +543,12 @@ final class AppState: ObservableObject {
         guard trail.count > 1 else { return }
         currentZoomPath = trail[trail.count - 2].path
         selectedNodeID = nil
+        refreshExplorerSnapshot()
     }
 
     func resetFilters() {
         storageFilter = StorageFilter()
+        refreshExplorerSnapshot()
     }
 
     // MARK: - Rule-Based Folder Cleanup (DEC-011)
@@ -584,6 +772,12 @@ final class AppState: ObservableObject {
                 verifiedArchives.append(record)
             }
 
+            // Invalidate cached scans of destination folders written during archiving (DEC-012).
+            let writtenDests = output.verifiedRecords.map(\.destinationPath)
+            if !writtenDests.isEmpty {
+                handleFileSystemChanges(writtenDests)
+            }
+
             let copiedTotal = output.report.copiedCount + output.report.renamedCount
             statusBanner = "Archive '\(job.name)': \(copiedTotal) copied, \(output.report.duplicateCount) duplicates skipped, \(output.report.unmatchedCount) unmatched. Originals retained until confirmed in Cleanup."
 
@@ -719,6 +913,11 @@ final class AppState: ObservableObject {
         // Remove verified archive records for originals that were actually deleted.
         let deletedLocations = Set(result.itemResults.filter(\.didDelete).map(\.location))
         verifiedArchives.removeAll { deletedLocations.contains($0.sourcePath) }
+
+        // Invalidate affected Storage Explorer caches immediately after deletion (DEC-012).
+        if !deletedLocations.isEmpty {
+            handleFileSystemChanges(Array(deletedLocations))
+        }
 
         selectedCleanupIDs.removeAll()
         persistState()

@@ -249,7 +249,9 @@ public struct ScanIssue: Identifiable, Hashable, Codable, Sendable {
 }
 
 /// Recursive file or directory tree node returned by StorageScanner.
-public struct StorageNode: Identifiable, Hashable, Sendable {
+/// Uses immutable reference semantics with O(1) Equatable/Hashable so SwiftUI never performs
+/// deep million-node structural comparisons on the Main Thread (DEC-012).
+public final class StorageNode: Identifiable, Hashable, Codable, @unchecked Sendable {
     public let id: String
     public let name: String
     public let path: String
@@ -291,11 +293,27 @@ public struct StorageNode: Identifiable, Hashable, Sendable {
         self.hasInaccessibleDescendants = hasInaccessibleDescendants
     }
 
+    /// O(1) equality check (never traverses descendants).
+    public static func == (lhs: StorageNode, rhs: StorageNode) -> Bool {
+        if lhs === rhs { return true }
+        return lhs.id == rhs.id
+            && lhs.allocatedSize == rhs.allocatedSize
+            && lhs.fileCount == rhs.fileCount
+            && lhs.modifiedDate == rhs.modifiedDate
+            && lhs.isDirectory == rhs.isDirectory
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(allocatedSize)
+        hasher.combine(fileCount)
+    }
+
     public func ageBucket(relativeTo referenceDate: Date = Date()) -> AgeBucket {
         AgeBucket.bucket(for: modifiedDate, relativeTo: referenceDate)
     }
 
-    /// Finds a descendant node by path (including self).
+    /// Finds a descendant node by path (including self) in O(depth).
     public func findNode(at targetPath: String) -> StorageNode? {
         if path == targetPath { return self }
         for child in children {
@@ -310,7 +328,7 @@ public struct StorageNode: Identifiable, Hashable, Sendable {
 }
 
 /// Complete or partial result of scanning a disk or folder.
-public struct ScanResult: Sendable {
+public struct ScanResult: Codable, Sendable {
     public let root: StorageNode
     public let scannedAt: Date
     public let duration: TimeInterval

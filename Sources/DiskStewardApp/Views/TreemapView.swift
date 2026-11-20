@@ -2,11 +2,13 @@ import AppKit
 import DiskStewardCore
 import SwiftUI
 
-/// Clean single-level-per-view structural treemap rendered via SwiftUI Canvas (REQ-003, DEC-010).
-/// Shows only the direct folders and files of the active scope sized strictly proportionally to allocated bytes,
-/// with high-contrast colors between adjacent tiles and drill-down into any folder.
+/// Clean 120 FPS single-level-per-view structural treemap rendered via SwiftUI Canvas (REQ-003, DEC-010, DEC-012).
+/// Receives ONLY the lightweight direct children of the active folder (never diffs the full disk tree)
+/// and holds hover highlight state strictly locally for zero-lag cursor tracking.
 struct TreemapView: View {
-    let scopeNode: StorageNode
+    let scopeKey: String
+    let scopeTotalBytes: Int64
+    let children: [StorageNode]
     let selectedNodeID: String?
     let onHover: (StorageNode?) -> Void
     let onSelect: (StorageNode) -> Void
@@ -17,10 +19,12 @@ struct TreemapView: View {
     @State private var hoveredTileID: String?
     @State private var hoveredTileNode: StorageNode?
     @State private var cachedSize: CGSize = .zero
-    @State private var cachedScopeID: String = ""
-    @State private var cachedScopeBytes: Int64 = -1
-    @State private var cachedScopeFiles: Int = -1
+    @State private var cachedKey: String = ""
     @State private var cachedTiles: [NestedTreemapTile] = []
+
+    private var layoutCacheKey: String {
+        "\(scopeKey)|\(scopeTotalBytes)|\(children.count)|\(children.first?.id ?? "")"
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -35,7 +39,6 @@ struct TreemapView: View {
                         drawTile(tile, isHovered: tile.id == hoveredTileID, in: &context)
                     }
 
-                    // Crisp highlight border on selected or hovered tile
                     if let selectedID = selectedNodeID,
                        let sel = tiles.first(where: { $0.node.id == selectedID }) {
                         let r = cgRect(sel.rect).insetBy(dx: 2, dy: 2)
@@ -126,21 +129,25 @@ struct TreemapView: View {
             .onChange(of: geo.size) { _, newSize in
                 recomputeCache(size: newSize)
             }
-            .onChange(of: scopeNode.id) { _, _ in
-                recomputeCache(size: geo.size)
-            }
-            .onChange(of: scopeNode.allocatedSize) { _, _ in
-                recomputeCache(size: geo.size)
-            }
-            .onChange(of: scopeNode.fileCount) { _, _ in
+            .onChange(of: layoutCacheKey) { _, _ in
                 recomputeCache(size: geo.size)
             }
         }
     }
 
     private func computeSingleLevelTiles(for size: CGSize) -> [NestedTreemapTile] {
-        TreemapLayout.computeNested(
-            scope: scopeNode,
+        let syntheticScope = StorageNode(
+            id: scopeKey,
+            name: scopeKey,
+            path: scopeKey,
+            isDirectory: true,
+            allocatedSize: max(1, scopeTotalBytes),
+            modifiedDate: Date(),
+            category: .other,
+            children: children
+        )
+        return TreemapLayout.computeNested(
+            scope: syntheticScope,
             in: TreemapRect(x: 0, y: 0, width: Double(size.width), height: Double(size.height)),
             maxDepth: 0,
             maxItemsPerLevel: 50
@@ -148,10 +155,7 @@ struct TreemapView: View {
     }
 
     private func currentTiles(for size: CGSize) -> [NestedTreemapTile] {
-        if cachedSize == size
-            && cachedScopeID == scopeNode.id
-            && cachedScopeBytes == scopeNode.allocatedSize
-            && cachedScopeFiles == scopeNode.fileCount {
+        if cachedSize == size && cachedKey == layoutCacheKey {
             return cachedTiles
         }
         return computeSingleLevelTiles(for: size)
@@ -160,9 +164,7 @@ struct TreemapView: View {
     private func recomputeCache(size: CGSize) {
         guard size.width > 4, size.height > 4 else { return }
         cachedSize = size
-        cachedScopeID = scopeNode.id
-        cachedScopeBytes = scopeNode.allocatedSize
-        cachedScopeFiles = scopeNode.fileCount
+        cachedKey = layoutCacheKey
         cachedTiles = computeSingleLevelTiles(for: size)
     }
 
@@ -188,7 +190,6 @@ struct TreemapView: View {
             ? Color(red: 0.40, green: 0.43, blue: 0.48)
             : tile.color.swiftUIColor
 
-        // Vivid solid tile with gentle cushion lighting
         context.fill(shape, with: .color(baseColor))
         context.fill(
             shape,
@@ -204,7 +205,6 @@ struct TreemapView: View {
         )
         context.stroke(shape, with: .color(Color.black.opacity(0.28)), lineWidth: 0.85)
 
-        // Adaptive crisp typography sized to the rectangle so folder names and sizes are instantly scannable
         guard rect.width >= 44 && rect.height >= 20 else { return }
 
         let isLarge = rect.width >= 150 && rect.height >= 76

@@ -10,13 +10,15 @@ private enum InspectorTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// Visual storage explorer with a multi-level structural treemap sized purely by allocated bytes,
-/// folder drill-down, single-focus or combined filters inside any folder, and direct link to rule-based cleanup (REQ-003, REQ-004, DEC-010, DEC-011).
+/// Instant, FSEvents-cached visual storage explorer (REQ-003, REQ-004, DEC-010, DEC-011, DEC-012).
+/// - All breakdowns, rankings, and filters run off the Main Thread via precomputed ExplorerSnapshots.
+/// - Hover state stays strictly local so moving the mouse triggers ZERO AppState or tree recomputation.
 struct StorageExplorerView: View {
     @EnvironmentObject private var appState: AppState
     @State private var inspectorTab: InspectorTab = .largest
     @State private var showIssuesPopover: Bool = false
     @State private var customExtInput: String = ""
+    @State private var hoveredNode: StorageNode?
 
     private let minSizeOptions: [(label: String, bytes: Int64)] = [
         ("Any Size", 0),
@@ -36,57 +38,80 @@ struct StorageExplorerView: View {
             if appState.isScanning {
                 scanningProgressBanner
                 Divider()
+            } else if appState.isRefreshingBackgroundCache {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Refreshing updated files in background…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.accentColor.opacity(0.07))
+                Divider()
             } else if let result = appState.scanResult, !result.isComplete {
                 incompleteScanBanner(result)
                 Divider()
             }
 
-            if let scope = appState.activeScopeNode {
-                breadcrumbBar(scope: scope)
+            if let snapshot = appState.explorerSnapshot, !snapshot.isEmptyDueToFilter {
+                breadcrumbBar(snapshot: snapshot)
                 Divider()
 
                 HSplitView {
-                    // Left: Deep Nested Structural Treemap + Hover Status Strip
+                    // Left: Single-Level Structural Treemap + Local Hover Strip (ZERO AppState mutation on hover!)
                     VStack(spacing: 10) {
                         TreemapView(
-                            scopeNode: scope,
+                            scopeKey: snapshot.scopePath,
+                            scopeTotalBytes: snapshot.scopeAllocatedBytes,
+                            children: snapshot.directChildren,
                             selectedNodeID: appState.selectedNodeID,
-                            onHover: { appState.hoveredNode = $0 },
+                            onHover: { hoveredNode = $0 },
                             onSelect: { appState.selectedNodeID = $0.id },
-                            onDrillDown: { appState.drillDown(to: $0) },
+                            onDrillDown: {
+                                hoveredNode = nil
+                                appState.drillDown(to: $0)
+                            },
                             onRevealInFinder: { appState.revealInFinder(path: $0) },
                             onCleanFolderByRule: { appState.openFolderCleanupFromExplorer(folderPath: $0) }
                         )
                         .frame(minHeight: 340)
 
-                        hoverStatusBar(scope: scope)
+                        hoverStatusBar(snapshot: snapshot)
                     }
                     .padding(14)
                     .frame(minWidth: 440)
 
-                    // Right: Largest Items / By File Type / By Date Breakdowns
+                    // Right: Precomputed Largest Items / By File Type / By Date Inspector
                     VStack(spacing: 10) {
-                        Picker("Inspector", selection: $inspectorTab) {
-                            ForEach(InspectorTab.allCases) { tab in
-                                Text(tab.rawValue).tag(tab)
+                        HStack {
+                            Picker("Inspector", selection: $inspectorTab) {
+                                ForEach(InspectorTab.allCases) { tab in
+                                    Text(tab.rawValue).tag(tab)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+
+                            if appState.isComputingSnapshot {
+                                ProgressView().controlSize(.small)
                             }
                         }
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
 
                         switch inspectorTab {
                         case .largest:
-                            largestItemsList(scope: scope)
+                            largestItemsList(snapshot: snapshot)
                         case .byType:
-                            categoryBreakdownView(scope: scope)
+                            categoryBreakdownView(snapshot: snapshot)
                         case .byDate:
-                            dateBreakdownView(scope: scope)
+                            dateBreakdownView(snapshot: snapshot)
                         }
                     }
                     .padding(14)
                     .frame(minWidth: 320, idealWidth: 380)
                 }
-            } else if appState.scanResult != nil && appState.storageFilter.isActive {
+            } else if let snapshot = appState.explorerSnapshot, snapshot.isEmptyDueToFilter {
                 VStack(spacing: 12) {
                     Image(systemName: "line.3.horizontal.decrease.circle")
                         .font(.system(size: 40))
@@ -104,6 +129,12 @@ struct StorageExplorerView: View {
                 emptyExplorerState
             }
         }
+        .onAppear {
+            appState.loadCachedExplorerIfAvailable()
+        }
+        .onChange(of: appState.storageFilter) { _, _ in
+            appState.refreshExplorerSnapshot()
+        }
     }
 
     // MARK: - Controls
@@ -114,7 +145,8 @@ struct StorageExplorerView: View {
                 Section("Connected Disks") {
                     ForEach(appState.connectedVolumes) { volume in
                         Button {
-                            appState.startScan(path: volume.mountPath)
+                            hoveredNode = nil
+                            appState.openInExplorer(path: volume.mountPath, forceRescan: false)
                         } label: {
                             Label("\(volume.name) (\(volume.mountPath))", systemImage: volume.isMainDisk ? "internaldrive" : "externaldrive")
                         }
@@ -123,21 +155,27 @@ struct StorageExplorerView: View {
                 Section("Common Folders") {
                     ForEach(commonShortcutFolders(), id: \.path) { folder in
                         Button {
-                            appState.startScan(path: folder.path)
+                            hoveredNode = nil
+                            appState.openInExplorer(path: folder.path, forceRescan: false)
                         } label: {
                             Label(folder.name, systemImage: "folder")
                         }
                     }
                 }
+                Divider()
+                Button("Clear Scan Cache") {
+                    appState.clearScanCache()
+                }
             } label: {
                 Label(shortPathLabel(appState.selectedScanPath), systemImage: "folder.badge.magnifyingglass")
                     .lineLimit(1)
             }
-            .frame(maxWidth: 260)
+            .frame(maxWidth: 250)
 
             Button("Choose Folder…") {
                 if let picked = appState.chooseFolder(title: "Select Disk or Folder to Analyze", initialPath: appState.selectedScanPath) {
-                    appState.startScan(path: picked)
+                    hoveredNode = nil
+                    appState.openInExplorer(path: picked, forceRescan: false)
                 }
             }
             .buttonStyle(.bordered)
@@ -150,11 +188,45 @@ struct StorageExplorerView: View {
                 .tint(.red)
             } else {
                 Button {
-                    appState.startScan()
+                    hoveredNode = nil
+                    appState.openInExplorer(path: appState.selectedScanPath, forceRescan: true)
                 } label: {
-                    Label("Scan", systemImage: "arrow.clockwise")
+                    Label(appState.scanResult == nil ? "Scan" : "Rescan", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderedProminent)
+            }
+
+            // Live FSEvents cache status indicator (DEC-012)
+            if appState.scanResult != nil && !appState.isScanning {
+                if appState.currentScanHasFSChanges {
+                    Button {
+                        appState.openInExplorer(path: appState.selectedScanPath, forceRescan: true)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Circle().fill(Color.orange).frame(width: 7, height: 7)
+                            Text("Files changed • Refresh")
+                                .font(.caption.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.orange.opacity(0.14))
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("FSEvents detected filesystem changes since this scan; click to refresh")
+                } else {
+                    HStack(spacing: 5) {
+                        Circle().fill(Color.green).frame(width: 7, height: 7)
+                        Text(appState.currentScanIsFromCache ? "Cached • Live Watch" : "Up to Date • Live Watch")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.green.opacity(0.10))
+                    .clipShape(Capsule())
+                    .help("Scan is cached in memory and on disk; FSEvents watches for filesystem changes automatically")
+                }
             }
 
             Spacer()
@@ -281,7 +353,6 @@ struct StorageExplorerView: View {
                                     appState.storageFilter.includedCategories.insert(category)
                                 }
                             } else {
-                                // Single-click selects only this category (clicking it again returns to All).
                                 if appState.storageFilter.includedCategories == [category] {
                                     appState.storageFilter.includedCategories = []
                                 } else {
@@ -370,9 +441,10 @@ struct StorageExplorerView: View {
         .background(Color.orange.opacity(0.12))
     }
 
-    private func breadcrumbBar(scope: StorageNode) -> some View {
+    private func breadcrumbBar(snapshot: ExplorerSnapshot) -> some View {
         HStack(spacing: 6) {
             Button {
+                hoveredNode = nil
                 appState.navigateUp()
             } label: {
                 Image(systemName: "chevron.left")
@@ -390,6 +462,7 @@ struct StorageExplorerView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Button(node.name) {
+                            hoveredNode = nil
                             appState.navigateBreadcrumb(to: node)
                         }
                         .buttonStyle(.borderless)
@@ -400,7 +473,7 @@ struct StorageExplorerView: View {
 
             Spacer()
 
-            Text("\(ByteFormatting.string(from: scope.allocatedSize)) • \(scope.fileCount.formatted()) file(s)")
+            Text("\(ByteFormatting.string(from: snapshot.scopeAllocatedBytes)) • \(snapshot.scopeFileCount.formatted()) file(s)")
                 .font(.caption.weight(.semibold).monospacedDigit())
             Text("• Sized by allocated disk space")
                 .font(.caption2)
@@ -410,9 +483,9 @@ struct StorageExplorerView: View {
         .padding(.vertical, 6)
     }
 
-    private func hoverStatusBar(scope: StorageNode) -> some View {
+    private func hoverStatusBar(snapshot: ExplorerSnapshot) -> some View {
         HStack(spacing: 8) {
-            if let hovered = appState.hoveredNode {
+            if let hovered = hoveredNode {
                 Image(systemName: hovered.isDirectory ? "folder.fill" : hovered.category.systemImage)
                     .foregroundStyle(.secondary)
                 Text(hovered.path)
@@ -420,8 +493,8 @@ struct StorageExplorerView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
-                let pct = scope.allocatedSize > 0
-                    ? ByteFormatting.percentString(Double(hovered.allocatedSize) / Double(scope.allocatedSize))
+                let pct = snapshot.scopeAllocatedBytes > 0
+                    ? ByteFormatting.percentString(Double(hovered.allocatedSize) / Double(snapshot.scopeAllocatedBytes))
                     : "0%"
                 Text("\(ByteFormatting.string(from: hovered.allocatedSize)) (\(pct))")
                     .font(.caption.weight(.semibold).monospacedDigit())
@@ -434,7 +507,7 @@ struct StorageExplorerView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let result = appState.scanResult {
-                    Text(String(format: "Scanned in %.2fs", result.duration))
+                    Text(result.duration > 0 ? String(format: "Scanned in %.2fs", result.duration) : "Loaded from cache")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -446,13 +519,12 @@ struct StorageExplorerView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
-    // MARK: - Right Inspector Views
+    // MARK: - Right Inspector Views (100% Precomputed Off-Main-Thread!)
 
-    private func largestItemsList(scope: StorageNode) -> some View {
-        let items = StorageAnalyzer.largestItems(in: scope, includeDirectories: false, limit: 150)
-        let scopeTotal = max(Int64(1), scope.allocatedSize)
+    private func largestItemsList(snapshot: ExplorerSnapshot) -> some View {
+        let scopeTotal = max(Int64(1), snapshot.scopeAllocatedBytes)
 
-        return List(items) { item in
+        return List(snapshot.largestItems) { item in
             let frac = Double(item.allocatedSize) / Double(scopeTotal)
             HStack(spacing: 8) {
                 Image(systemName: item.category.systemImage)
@@ -498,9 +570,8 @@ struct StorageExplorerView: View {
         .listStyle(.inset)
     }
 
-    private func categoryBreakdownView(scope: StorageNode) -> some View {
-        let rows = StorageAnalyzer.categoryBreakdown(in: scope)
-        return List(rows) { row in
+    private func categoryBreakdownView(snapshot: ExplorerSnapshot) -> some View {
+        List(snapshot.categoryBreakdown) { row in
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Image(systemName: row.category.systemImage)
@@ -534,36 +605,33 @@ struct StorageExplorerView: View {
         .listStyle(.inset)
     }
 
-    private func dateBreakdownView(scope: StorageNode) -> some View {
-        let rows = StorageAnalyzer.ageBreakdown(in: scope)
-        return VStack(spacing: 0) {
-            List(rows) { row in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(row.bucket.colorSpec.swiftUIColor)
-                            .frame(width: 12, height: 12)
-                        Text(row.bucket.displayName)
-                            .font(.subheadline.weight(.medium))
-                        Spacer()
-                        Text(ByteFormatting.string(from: row.totalBytes))
-                            .font(.subheadline.weight(.semibold).monospacedDigit())
-                    }
-                    ProgressView(value: row.fraction)
-                        .tint(row.bucket.colorSpec.swiftUIColor)
-                    HStack {
-                        Text(row.bucket.colorSpec.explanation)
-                            .lineLimit(1)
-                        Spacer()
-                        Text("\(row.fileCount.formatted()) file(s) • \(ByteFormatting.percentString(row.fraction))")
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+    private func dateBreakdownView(snapshot: ExplorerSnapshot) -> some View {
+        List(snapshot.ageBreakdown) { row in
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(row.bucket.colorSpec.swiftUIColor)
+                        .frame(width: 12, height: 12)
+                    Text(row.bucket.displayName)
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(ByteFormatting.string(from: row.totalBytes))
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
                 }
-                .padding(.vertical, 3)
+                ProgressView(value: row.fraction)
+                    .tint(row.bucket.colorSpec.swiftUIColor)
+                HStack {
+                    Text(row.bucket.colorSpec.explanation)
+                        .lineLimit(1)
+                    Spacer()
+                    Text("\(row.fileCount.formatted()) file(s) • \(ByteFormatting.percentString(row.fraction))")
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             }
-            .listStyle(.inset)
+            .padding(.vertical, 3)
         }
+        .listStyle(.inset)
     }
 
     private var emptyExplorerState: some View {
@@ -573,14 +641,14 @@ struct StorageExplorerView: View {
                 .foregroundStyle(Color.accentColor)
             Text("Visual Storage Explorer")
                 .font(.title2.weight(.semibold))
-            Text("Select a disk or folder and click Scan to explore nested storage hierarchy sized proportionally by allocated space.")
+            Text("Select a disk or folder to explore storage usage. Completed scans are cached automatically and invalidated by macOS FSEvents when files change.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 480)
             HStack(spacing: 10) {
                 Button {
-                    appState.startScan()
+                    appState.openInExplorer(path: appState.selectedScanPath, forceRescan: false)
                 } label: {
                     Label("Scan \(shortPathLabel(appState.selectedScanPath))", systemImage: "magnifyingglass")
                 }
@@ -588,7 +656,7 @@ struct StorageExplorerView: View {
 
                 Button("Choose Another Folder…") {
                     if let picked = appState.chooseFolder(title: "Select Folder to Analyze") {
-                        appState.startScan(path: picked)
+                        appState.openInExplorer(path: picked, forceRescan: false)
                     }
                 }
                 .buttonStyle(.bordered)
