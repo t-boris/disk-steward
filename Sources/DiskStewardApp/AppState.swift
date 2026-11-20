@@ -107,6 +107,7 @@ final class AppState: ObservableObject {
     private var snapshotGeneration: UInt64 = 0
 
     private var scanTask: Task<Void, Never>?
+    private var autoRefreshDebounceTask: Task<Void, Never>?
     private var archiveTask: Task<ArchiveExecutionOutput, Never>?
     private nonisolated(unsafe) var volumeTimer: Timer?
     private nonisolated(unsafe) var scheduleTimer: Timer?
@@ -356,25 +357,38 @@ final class AppState: ObservableObject {
 
     /// Incrementally rescans ONLY the changed directories detected by FSEvents and splices them
     /// back into the cached root tree (never rescanning untouched folders from root, DEC-012).
-    func refreshDirtyFolders(forRoot overrideRoot: String? = nil) {
+    /// When `scopedToDirectory` is given, rescans only dirty directories inside that folder.
+    func refreshDirtyFolders(forRoot overrideRoot: String? = nil, scopedToDirectory: String? = nil) {
         let rootPath = URL(fileURLWithPath: overrideRoot ?? scanResult?.root.path ?? selectedScanPath).standardizedFileURL.path
         guard let cached = scanCacheManager.lookup(path: rootPath, loadFromDiskIfNeeded: false) else {
             startScan(path: rootPath, backgroundRefresh: false)
             return
         }
 
-        let dirtyDirs = cached.minimalDirtyDirectories
+        var dirtyDirs = cached.minimalDirtyDirectories
+        if let scopeDir = scopedToDirectory {
+            let stdScope = URL(fileURLWithPath: scopeDir).standardizedFileURL.path
+            dirtyDirs = dirtyDirs.filter { dir in
+                dir == stdScope || dir.hasPrefix(stdScope + "/") || stdScope.hasPrefix(dir + "/")
+            }
+        }
+
         guard !dirtyDirs.isEmpty else {
-            currentScanHasFSChanges = false
-            dirtyFolderCount = 0
+            if scopedToDirectory == nil {
+                currentScanHasFSChanges = false
+                dirtyFolderCount = 0
+            }
             return
         }
 
-        // Only fall back to full root rescan if root itself is dirty or dozens of disjoint top-level trees changed.
-        guard cached.canIncrementalRefresh else {
+        // Never escalate an incremental click to a full root scan if only subdirectories changed.
+        if dirtyDirs.count == 1 && dirtyDirs[0] == rootPath {
             startScan(path: rootPath, backgroundRefresh: true)
             return
         }
+
+        // Rescan at most 20 dirty directories per pass; any remaining stay cleanly queued.
+        let batchToScan = Array(dirtyDirs.prefix(20))
 
         scanTask?.cancel()
         isRefreshingBackgroundCache = true
@@ -386,7 +400,7 @@ final class AppState: ObservableObject {
             var updates: [(path: String, node: StorageNode?, addedIssues: [ScanIssue])] = []
             let fm = FileManager.default
 
-            for dirPath in dirtyDirs {
+            for dirPath in batchToScan {
                 if Task.isCancelled { break }
                 var isDir: ObjCBool = false
                 if fm.fileExists(atPath: dirPath, isDirectory: &isDir), isDir.boolValue {
@@ -395,7 +409,6 @@ final class AppState: ObservableObject {
                         updates.append((path: dirPath, node: subRes.root, addedIssues: subRes.issues))
                     }
                 } else {
-                    // Directory was removed from disk -> remove from cached tree.
                     updates.append((path: dirPath, node: nil, addedIssues: []))
                 }
             }
@@ -419,9 +432,16 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 self.isRefreshingBackgroundCache = false
                 if let patched {
-                    self.applyScanResult(patched, fromCache: true, isDirty: false, dirtyCount: 0, preserveZoomIfValid: true)
+                    let remaining = cacheManager.lookup(path: rootPath, loadFromDiskIfNeeded: false)?.minimalDirtyDirectories.count ?? 0
+                    self.applyScanResult(
+                        patched,
+                        fromCache: true,
+                        isDirty: remaining > 0,
+                        dirtyCount: remaining,
+                        preserveZoomIfValid: true
+                    )
                     self.statusBanner = String(
-                        format: "Incrementally updated %d changed folder(s) in %.2fs (untouched folders kept from cache).",
+                        format: "Updated %d changed folder(s) in %.2fs (untouched folders kept from cache).",
                         updates.count,
                         elapsed
                     )
@@ -675,8 +695,27 @@ final class AppState: ObservableObject {
         if let currentRoot = scanResult?.root.path {
             let stdCurrent = URL(fileURLWithPath: currentRoot).standardizedFileURL.path
             if dirtyRoots.contains(stdCurrent) {
-                currentScanHasFSChanges = true
-                dirtyFolderCount = scanCacheManager.lookup(path: stdCurrent, loadFromDiskIfNeeded: false)?.minimalDirtyDirectories.count ?? 1
+                let dirtyDirs = scanCacheManager.lookup(path: stdCurrent, loadFromDiskIfNeeded: false)?.minimalDirtyDirectories ?? []
+                currentScanHasFSChanges = !dirtyDirs.isEmpty
+                dirtyFolderCount = dirtyDirs.count
+
+                // If changes occurred inside the folder the user is currently viewing (when zoomed in,
+                // or a small localized change), auto-splice those changed folders smoothly after a short 1.5s debounce!
+                if selectedSection == .explorer, !isScanning, !isRefreshingBackgroundCache {
+                    let activeZoom = URL(fileURLWithPath: currentZoomPath ?? stdCurrent).standardizedFileURL.path
+                    let affectsActiveFolder = dirtyDirs.contains { dir in
+                        dir == activeZoom || dir.hasPrefix(activeZoom + "/")
+                    }
+                    if affectsActiveFolder && dirtyDirs.count <= 6 {
+                        autoRefreshDebounceTask?.cancel()
+                        autoRefreshDebounceTask = Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            guard !Task.isCancelled, let self else { return }
+                            guard !self.isScanning, !self.isRefreshingBackgroundCache else { return }
+                            self.refreshDirtyFolders(forRoot: stdCurrent, scopedToDirectory: activeZoom)
+                        }
+                    }
+                }
             }
         }
     }
@@ -701,6 +740,20 @@ final class AppState: ObservableObject {
         currentZoomPath = node.path
         selectedNodeID = nil
         refreshExplorerSnapshot()
+
+        // If this newly entered folder has queued dirty subfolders, splice them silently right away!
+        if let rootPath = scanResult?.root.path, currentScanHasFSChanges, !isScanning, !isRefreshingBackgroundCache {
+            let stdRoot = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+            if let cached = scanCacheManager.lookup(path: stdRoot, loadFromDiskIfNeeded: false) {
+                let targetPath = URL(fileURLWithPath: node.path).standardizedFileURL.path
+                let hasDirtyInside = cached.minimalDirtyDirectories.contains { dir in
+                    dir == targetPath || dir.hasPrefix(targetPath + "/")
+                }
+                if hasDirtyInside {
+                    refreshDirtyFolders(forRoot: stdRoot, scopedToDirectory: targetPath)
+                }
+            }
+        }
     }
 
     func navigateBreadcrumb(to node: StorageNode) {
@@ -1038,6 +1091,96 @@ final class AppState: ObservableObject {
         guard let proposal = cleanupProposal else { return }
         for item in proposal.candidates(in: category) {
             selectedCleanupIDs.remove(item.id)
+        }
+    }
+
+    // MARK: - Persistent Cleanup Exclusions / Dismiss (DEC-013)
+
+    /// Persistently dismisses a single cleanup proposal so it will not reappear until restored.
+    func ignoreCleanupCandidate(_ candidate: CleanupCandidate) {
+        let exclusion = CleanupExclusion(
+            candidateID: candidate.id,
+            pathPrefix: candidate.isDockerArtifact ? nil : candidate.location,
+            label: candidate.title
+        )
+        addCleanupExclusions([exclusion])
+        statusBanner = "Ignored '\(candidate.title)'. It will not appear in future cleanup proposals."
+    }
+
+    /// Persistently dismisses all currently selected cleanup proposals.
+    func ignoreSelectedCleanupCandidates() {
+        let selected = selectedCleanupCandidates
+        guard !selected.isEmpty else { return }
+        let exclusions = selected.map { candidate in
+            CleanupExclusion(
+                candidateID: candidate.id,
+                pathPrefix: candidate.isDockerArtifact ? nil : candidate.location,
+                label: candidate.title
+            )
+        }
+        addCleanupExclusions(exclusions)
+        statusBanner = "Ignored \(selected.count) cleanup proposal(s). You can restore them anytime from Ignored Items."
+    }
+
+    /// Persistently ignores an entire folder (and everything inside it) from future cleanup proposals.
+    func ignoreCleanupFolder(path: String, label: String? = nil) {
+        let stdPath = URL(fileURLWithPath: path).standardizedFileURL.path
+        let folderName = label ?? URL(fileURLWithPath: stdPath).lastPathComponent
+        let exclusion = CleanupExclusion(
+            candidateID: nil,
+            pathPrefix: stdPath,
+            label: "Folder: \(folderName)"
+        )
+        addCleanupExclusions([exclusion])
+        statusBanner = "Ignored folder '\(stdPath)'. Items inside will no longer appear in cleanup proposals."
+    }
+
+    /// Restores a previously ignored item or folder and refreshes cleanup proposals.
+    func restoreCleanupExclusion(id: UUID) {
+        configuration.cleanupExclusions.removeAll { $0.id == id }
+        persistState()
+        Task { [weak self] in
+            await self?.refreshCleanupProposals()
+        }
+    }
+
+    /// Restores all ignored items and folders and refreshes cleanup proposals.
+    func restoreAllCleanupExclusions() {
+        configuration.cleanupExclusions.removeAll()
+        persistState()
+        statusBanner = "Restored all ignored cleanup items."
+        Task { [weak self] in
+            await self?.refreshCleanupProposals()
+        }
+    }
+
+    private func addCleanupExclusions(_ newExclusions: [CleanupExclusion]) {
+        for exclusion in newExclusions {
+            let alreadyExists = configuration.cleanupExclusions.contains { existing in
+                (exclusion.candidateID != nil && existing.candidateID == exclusion.candidateID)
+                    || (exclusion.pathPrefix != nil && existing.pathPrefix == exclusion.pathPrefix)
+            }
+            if !alreadyExists {
+                configuration.cleanupExclusions.append(exclusion)
+            }
+        }
+        persistState()
+
+        // Immediately filter out newly excluded candidates from the current visible proposal without waiting for a rescan.
+        if let proposal = cleanupProposal {
+            let exclusions = configuration.cleanupExclusions
+            let remaining = proposal.candidates.filter { candidate in
+                !exclusions.contains(where: { $0.matches(candidate) })
+            }
+            cleanupProposal = CleanupProposal(
+                id: proposal.id,
+                createdAt: proposal.createdAt,
+                candidates: remaining,
+                notes: proposal.notes,
+                dockerStatusMessage: proposal.dockerStatusMessage
+            )
+            let remainingIDs = Set(remaining.map(\.id))
+            selectedCleanupIDs = selectedCleanupIDs.intersection(remainingIDs)
         }
     }
 

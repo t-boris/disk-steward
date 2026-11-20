@@ -238,4 +238,45 @@ final class CleanupScannerAndExecutorTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: fileD.path))
         XCTAssertEqual(deleter.permanentlyDeletedURLs.count, 1)
     }
+
+    func testPersistentExclusionsSuppressDismissedItemsAndExcludedFolders() async throws {
+        let fm = FileManager.default
+        let downloads = fakeHome.appendingPathComponent("Downloads")
+        let keepProjectNM = fakeHome.appendingPathComponent("Projects/keep-app/node_modules/pkg")
+        let dropProjectNM = fakeHome.appendingPathComponent("Projects/old-app/node_modules/pkg")
+        try fm.createDirectory(at: downloads, withIntermediateDirectories: true)
+        try fm.createDirectory(at: keepProjectNM, withIntermediateDirectories: true)
+        try fm.createDirectory(at: dropProjectNM, withIntermediateDirectories: true)
+
+        let bigA = downloads.appendingPathComponent("keep-iso.dmg")
+        let bigB = downloads.appendingPathComponent("other-big.zip")
+        try Data(repeating: 0x11, count: 1_500_000).write(to: bigA)
+        try Data(repeating: 0x22, count: 1_500_000).write(to: bigB)
+        try Data(repeating: 0x33, count: 20_000).write(to: keepProjectNM.appendingPathComponent("index.js"))
+        try Data(repeating: 0x44, count: 20_000).write(to: dropProjectNM.appendingPathComponent("index.js"))
+
+        let baseConfig = AppConfiguration(
+            cleanupLargeFileThresholdBytes: 1_000_000,
+            cleanupUserFileRoots: [downloads.path],
+            nodeModulesSearchRoots: [fakeHome.appendingPathComponent("Projects").path],
+            includeCacheCleanup: false,
+            includeDockerCleanup: false
+        )
+
+        let scanner = CleanupScanner(dockerInspector: DockerInspector(runner: MockDockerRunner(available: false)), homeDirectory: fakeHome.path)
+        let before = await scanner.discoverProposals(configuration: baseConfig, verifiedArchives: [])
+        XCTAssertEqual(before.candidates(in: .userFiles).count, 2)
+        XCTAssertEqual(before.candidates(in: .nodeModules).count, 2)
+
+        // Exclude bigA by exact path AND exclude the entire "Projects/keep-app" folder!
+        var excludedConfig = baseConfig
+        excludedConfig.cleanupExclusions = [
+            CleanupExclusion(candidateID: "file:\(bigA.standardizedFileURL.path)", pathPrefix: bigA.path, label: "keep-iso.dmg"),
+            CleanupExclusion(candidateID: nil, pathPrefix: fakeHome.appendingPathComponent("Projects/keep-app").path, label: "Folder: keep-app")
+        ]
+
+        let after = await scanner.discoverProposals(configuration: excludedConfig, verifiedArchives: [])
+        XCTAssertEqual(after.candidates(in: .userFiles).map(\.title), ["other-big.zip"])
+        XCTAssertEqual(after.candidates(in: .nodeModules).map(\.title), ["old-app/node_modules"])
+    }
 }

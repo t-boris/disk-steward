@@ -5,6 +5,7 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
     public var volumeRefreshIntervalSeconds: TimeInterval
     public var archiveJobs: [ArchiveJob]
     public var cleanupRules: [CleanupRule]
+    public var cleanupExclusions: [CleanupExclusion]
     public var cleanupLargeFileThresholdBytes: Int64
     public var cleanupOldInstallerAgeDays: Int
     public var cleanupUserFileRoots: [String]
@@ -17,6 +18,7 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
         volumeRefreshIntervalSeconds: TimeInterval = 30,
         archiveJobs: [ArchiveJob] = [],
         cleanupRules: [CleanupRule] = [],
+        cleanupExclusions: [CleanupExclusion] = [],
         cleanupLargeFileThresholdBytes: Int64 = 100 * 1_000_000, // 100 MB
         cleanupOldInstallerAgeDays: Int = 14,
         cleanupUserFileRoots: [String]? = nil,
@@ -28,6 +30,7 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
         self.volumeRefreshIntervalSeconds = max(5, volumeRefreshIntervalSeconds)
         self.archiveJobs = archiveJobs
         self.cleanupRules = cleanupRules
+        self.cleanupExclusions = cleanupExclusions
         self.cleanupLargeFileThresholdBytes = max(1_000_000, cleanupLargeFileThresholdBytes)
         self.cleanupOldInstallerAgeDays = max(0, cleanupOldInstallerAgeDays)
         self.cleanupUserFileRoots = cleanupUserFileRoots ?? Self.defaultUserFileRoots()
@@ -41,6 +44,7 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
         case volumeRefreshIntervalSeconds
         case archiveJobs
         case cleanupRules
+        case cleanupExclusions
         case cleanupLargeFileThresholdBytes
         case cleanupOldInstallerAgeDays
         case cleanupUserFileRoots
@@ -55,6 +59,7 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
         volumeRefreshIntervalSeconds = max(5, try c.decodeIfPresent(TimeInterval.self, forKey: .volumeRefreshIntervalSeconds) ?? 30)
         archiveJobs = try c.decodeIfPresent([ArchiveJob].self, forKey: .archiveJobs) ?? []
         cleanupRules = try c.decodeIfPresent([CleanupRule].self, forKey: .cleanupRules) ?? []
+        cleanupExclusions = try c.decodeIfPresent([CleanupExclusion].self, forKey: .cleanupExclusions) ?? []
         cleanupLargeFileThresholdBytes = max(1_000_000, try c.decodeIfPresent(Int64.self, forKey: .cleanupLargeFileThresholdBytes) ?? 100 * 1_000_000)
         cleanupOldInstallerAgeDays = max(0, try c.decodeIfPresent(Int.self, forKey: .cleanupOldInstallerAgeDays) ?? 14)
         cleanupUserFileRoots = try c.decodeIfPresent([String].self, forKey: .cleanupUserFileRoots) ?? Self.defaultUserFileRoots()

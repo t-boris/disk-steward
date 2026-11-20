@@ -62,9 +62,18 @@ public struct CleanupScanner: Sendable {
             dockerStatus = "Docker cleanup inspection is disabled in settings."
         }
 
-        // Deduplicate by ID and sort largest first within each category.
+        // Filter out persistently dismissed items and excluded folders (DEC-013), deduplicate by ID,
+        // and sort largest first within each category.
+        let exclusions = configuration.cleanupExclusions
         var seenIDs: Set<String> = []
-        let unique = candidates.filter { seenIDs.insert($0.id).inserted }
+        let unique = candidates
+            .filter { candidate in
+                guard seenIDs.insert(candidate.id).inserted else { return false }
+                if !exclusions.isEmpty && exclusions.contains(where: { $0.matches(candidate) }) {
+                    return false
+                }
+                return true
+            }
             .sorted { lhs, rhs in
                 if lhs.category != rhs.category {
                     return CleanupCategory.allCases.firstIndex(of: lhs.category)! < CleanupCategory.allCases.firstIndex(of: rhs.category)!

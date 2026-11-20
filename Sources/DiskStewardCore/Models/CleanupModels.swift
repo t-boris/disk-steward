@@ -34,6 +34,44 @@ public enum CleanupCategory: String, CaseIterable, Codable, Sendable, Identifiab
     }
 }
 
+/// Persisted rule telling CleanupScanner to hide a dismissed item or an entire folder permanently until restored (DEC-013).
+public struct CleanupExclusion: Identifiable, Hashable, Codable, Sendable {
+    public var id: UUID
+    /// Exact candidate ID (covers Docker artifacts, caches, node_modules, files, archived originals).
+    public var candidateID: String?
+    /// Exact file/folder path or parent folder prefix to ignore recursively.
+    public var pathPrefix: String?
+    public var label: String
+    public var createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        candidateID: String? = nil,
+        pathPrefix: String? = nil,
+        label: String,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.candidateID = candidateID
+        self.pathPrefix = pathPrefix.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        self.label = label
+        self.createdAt = createdAt
+    }
+
+    public func matches(_ candidate: CleanupCandidate) -> Bool {
+        if let cid = candidateID, cid == candidate.id {
+            return true
+        }
+        if let prefix = pathPrefix, !prefix.isEmpty, !candidate.isDockerArtifact {
+            let loc = URL(fileURLWithPath: candidate.location).standardizedFileURL.path
+            if loc == prefix || loc.hasPrefix(prefix + "/") {
+                return true
+            }
+        }
+        return false
+    }
+}
+
 /// A user-defined rule targeting a specific folder to recursively find and propose matching files for cleanup (DEC-011).
 public struct CleanupRule: Identifiable, Hashable, Codable, Sendable {
     public var id: UUID

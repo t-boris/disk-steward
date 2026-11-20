@@ -1,9 +1,9 @@
 import CoreServices
 import Foundation
 
-/// Watches macOS directories via FSEvents and reports ONLY real structural or content mutations
-/// (create, delete, rename, content modify) so ScanCacheManager can incrementally rescan just
-/// the affected subdirectories without rescanning untouched folders (DEC-012).
+/// Watches macOS directories via FSEvents and reports ONLY real user-meaningful structural or content
+/// mutations (create, delete, rename, modify), aggressively filtering out OS and background-app
+/// runtime/cache/WAL chatter so dirty-folder tracking stays quiet and accurate (DEC-012).
 public final class FileSystemWatcher: @unchecked Sendable {
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "com.disksteward.fsevents", qos: .utility)
@@ -11,19 +11,65 @@ public final class FileSystemWatcher: @unchecked Sendable {
     private var watchedPaths: [String] = []
     private let onPathsChanged: @Sendable ([String]) -> Void
 
-    private static let ignoredPathSubstrings: [String] = [
+    /// High-frequency background runtime/cache/database paths that mutate continuously while apps run
+    /// (browsers, chat apps, IDEs, AI assistants, macOS daemons) and should not flood dirty-folder state.
+    public static let ignoredPathSubstrings: [String] = [
         "/.DS_Store",
         "/.Spotlight-V100",
         "/.fseventsd",
         "/.Trashes",
-        "/Library/Caches/DiskSteward",
-        "/Application Support/DiskSteward",
-        "/Library/Caches/com.apple.",
+        "/.Trash/",
+        "/.gemini/",
+        "/.dde/",
+        "/.claude/",
+        "/.codex/",
+        "/.ollama/",
+        "/.npm/",
+        "/.cache/",
+        "/Library/Caches/",
         "/Library/Logs/",
+        "/Library/Saved Application State/",
+        "/Library/HTTPStorages/",
+        "/Library/Cookies/",
+        "/Library/Preferences/",
+        "/Library/Metadata/",
+        "/Library/Biome/",
+        "/Library/Suggestions/",
+        "/Library/WebKit/",
+        "/Library/Containers/",
+        "/Library/Group Containers/",
+        "/Library/Application Support/DiskSteward",
+        "/Library/Application Support/Google/Chrome",
+        "/Library/Application Support/Microsoft",
+        "/Library/Application Support/Slack",
+        "/Library/Application Support/Discord",
+        "/Library/Application Support/Spotify",
+        "/Library/Application Support/Code",
+        "/Library/Application Support/Cursor",
+        "/Library/Application Support/Obsidian",
+        "/Library/Application Support/Claude",
+        "/Library/Application Support/ChatGPT",
+        "/Library/Application Support/com.apple.",
+        "/Library/Application Support/CrashReporter",
         "/System/Volumes/",
         "/private/var/",
         "/private/tmp/",
         "/dev/"
+    ]
+
+    /// Ephemeral database WAL/SHM/temp/lock suffixes that constantly churn during normal app usage.
+    private static let ignoredFileSuffixes: [String] = [
+        "-wal",
+        "-shm",
+        "-journal",
+        ".tmp",
+        ".temp",
+        ".crswap",
+        ".crdownload",
+        ".lock",
+        ".lck",
+        ".swp",
+        ".part"
     ]
 
     /// FSEvent item flags representing actual size or structure mutations (excludes pure FinderInfo/xattr/inode metadata chatter).
@@ -33,7 +79,6 @@ public final class FileSystemWatcher: @unchecked Sendable {
             | kFSEventStreamEventFlagItemRenamed
             | kFSEventStreamEventFlagItemModified
             | kFSEventStreamEventFlagItemCloned
-            | kFSEventStreamEventFlagMustScanSubDirs
     )
 
     public init(onPathsChanged: @escaping @Sendable ([String]) -> Void) {
@@ -42,6 +87,19 @@ public final class FileSystemWatcher: @unchecked Sendable {
 
     deinit {
         stop()
+    }
+
+    /// Returns true if `path` is high-frequency background runtime/cache/WAL chatter that should be ignored by FSEvents.
+    public static func shouldIgnorePath(_ path: String) -> Bool {
+        if path == "/" || path == "/Volumes" { return true }
+        let lower = path.lowercased()
+        for suffix in ignoredFileSuffixes {
+            if lower.hasSuffix(suffix) { return true }
+        }
+        for token in ignoredPathSubstrings {
+            if path.contains(token) { return true }
+        }
+        return false
     }
 
     /// Starts or restarts FSEvents monitoring for the given directory paths.
@@ -86,21 +144,11 @@ public final class FileSystemWatcher: @unchecked Sendable {
 
             for idx in 0..<min(numEvents, rawPaths.count) {
                 let flags = eventFlags[idx]
-                // Ignore pure metadata-only events (xattr, FinderInfo, Spotlight) that do not alter file sizes or presence.
+                // Ignore pure metadata-only events (xattr, FinderInfo, Spotlight) and kernel overflow flags.
                 guard (flags & FileSystemWatcher.meaningfulChangeMask) != 0 else { continue }
 
                 let path = rawPaths[idx]
-                // Ignore synthetic root-only "/" events so OS chatter does not trigger full-disk invalidation.
-                if path == "/" || path == "/Volumes" { continue }
-
-                var ignored = false
-                for token in FileSystemWatcher.ignoredPathSubstrings {
-                    if path.contains(token) {
-                        ignored = true
-                        break
-                    }
-                }
-                if !ignored {
+                if !FileSystemWatcher.shouldIgnorePath(path) {
                     meaningful.append(path)
                 }
             }
@@ -116,7 +164,7 @@ public final class FileSystemWatcher: @unchecked Sendable {
             &context,
             cfPaths,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            1.2, // Coalesce rapid bursts within 1.2s
+            1.5,
             flags
         ) {
             FSEventStreamSetDispatchQueue(stream, queue)

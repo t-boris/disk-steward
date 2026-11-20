@@ -26,16 +26,18 @@ public struct CachedScanEntry: Sendable {
     }
 
     /// Collapses `dirtyDirectories` so if both a parent and its child are dirty, only the parent is returned.
+    /// If many sibling subfolders inside the same immediate child of `rootPath` are dirty (e.g. unzip/npm install),
+    /// rolls them up to that common child folder so the dirty list stays compact and fast to rescan.
     public var minimalDirtyDirectories: [String] {
         Self.collapseMinimalDirectories(Array(dirtyDirectories), rootPath: rootPath)
     }
 
-    /// True if incremental subtree patching is practical (i.e., root itself isn't the sole dirty path and count is bounded).
+    /// True whenever there are specific subdirectories to incrementally rescan (never forces a root rescan).
     public var canIncrementalRefresh: Bool {
         let minimal = minimalDirtyDirectories
         guard !minimal.isEmpty else { return false }
         if minimal.count == 1 && minimal[0] == rootPath { return false }
-        return minimal.count <= 40
+        return true
     }
 
     public static func collapseMinimalDirectories(_ directories: [String], rootPath: String) -> [String] {
@@ -60,7 +62,41 @@ public struct CachedScanEntry: Sendable {
                 minimal.append(candidate)
             }
         }
+
+        // If > 8 dirty directories accumulated (e.g. a batch operation across nested subfolders),
+        // roll up branches that share a common parent below rootPath so incremental refresh stays tiny.
+        if minimal.count > 8 {
+            var groupedByTopChild: [String: [String]] = [:]
+            for dir in minimal {
+                let bucket = firstSubdirectory(of: dir, under: stdRoot) ?? dir
+                groupedByTopChild[bucket, default: []].append(dir)
+            }
+            var rolledUp: [String] = []
+            for (bucket, members) in groupedByTopChild {
+                if members.count >= 4 && bucket != stdRoot {
+                    rolledUp.append(bucket)
+                } else {
+                    rolledUp.append(contentsOf: members)
+                }
+            }
+            minimal = Array(Set(rolledUp))
+        }
+
         return minimal.sorted()
+    }
+
+    private static func firstSubdirectory(of path: String, under root: String) -> String? {
+        if path == root { return root }
+        let rel: String
+        if root == "/" {
+            rel = String(path.dropFirst())
+        } else if path.hasPrefix(root + "/") {
+            rel = String(path.dropFirst(root.count + 1))
+        } else {
+            return nil
+        }
+        guard let firstComp = rel.split(separator: "/").first else { return nil }
+        return root == "/" ? "/\(firstComp)" : "\(root)/\(firstComp)"
     }
 }
 

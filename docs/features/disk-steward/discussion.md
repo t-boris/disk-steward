@@ -83,3 +83,7 @@ User refined DEC-010 after inspecting v1.1.0: do not draw deep multi-level micro
 ### Agent · 2026-11-20
 
 User clarified that when FSEvents detects filesystem changes (e.g. cleaning files in a folder via Finder), refreshing must NEVER rescan the entire disk from root: it must rescan only the changed directories and splice the updated subtrees back into the cached tree while preserving all untouched folders.
+
+### Agent · 2026-11-20
+
+User requested persistent dismissal/ignore for Cleanup Proposals (single item, bulk selected items, or an entire folder) so previously declined proposals stop reappearing and inflating proposal badge counts (DEC-013).

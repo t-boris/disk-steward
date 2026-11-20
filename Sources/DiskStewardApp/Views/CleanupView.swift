@@ -7,6 +7,7 @@ import SwiftUI
 struct CleanupView: View {
     @EnvironmentObject private var appState: AppState
     @State private var showSettingsPopover: Bool = false
+    @State private var showIgnoredPopover: Bool = false
     @State private var showRuleBuilder: Bool = true
     @State private var extensionsInput: String = "zip"
 
@@ -54,6 +55,16 @@ struct CleanupView: View {
                     Label(showRuleBuilder ? "Hide Folder Rule" : "Folder Rule Cleanup", systemImage: "wand.and.stars")
                 }
                 .buttonStyle(.bordered)
+
+                Button {
+                    showIgnoredPopover.toggle()
+                } label: {
+                    Label("Ignored (\(appState.configuration.cleanupExclusions.count))", systemImage: "eye.slash")
+                }
+                .buttonStyle(.bordered)
+                .popover(isPresented: $showIgnoredPopover) {
+                    ignoredExclusionsPopover
+                }
 
                 Button {
                     showSettingsPopover.toggle()
@@ -224,6 +235,14 @@ struct CleanupView: View {
                         appState.selectedCleanupIDs.removeAll()
                     }
                     .buttonStyle(.bordered)
+
+                    Button {
+                        appState.ignoreSelectedCleanupCandidates()
+                    } label: {
+                        Label("Ignore Selected", systemImage: "eye.slash")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Persistently dismiss the selected proposals so they never reappear")
                 }
 
                 Button {
@@ -497,15 +516,118 @@ struct CleanupView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            Button {
+                appState.ignoreCleanupCandidate(candidate)
+            } label: {
+                Image(systemName: "eye.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Dismiss and permanently ignore this proposal")
         }
         .padding(.vertical, 3)
         .contextMenu {
+            Button("Ignore This Item") {
+                appState.ignoreCleanupCandidate(candidate)
+            }
             if !candidate.isDockerArtifact {
+                let targetFolder = candidate.isDirectory
+                    ? candidate.location
+                    : URL(fileURLWithPath: candidate.location).deletingLastPathComponent().path
+                let parentFolder = URL(fileURLWithPath: candidate.location).deletingLastPathComponent().path
+                if candidate.isDirectory {
+                    Button("Ignore Parent Folder (\(URL(fileURLWithPath: parentFolder).lastPathComponent))") {
+                        appState.ignoreCleanupFolder(path: parentFolder)
+                    }
+                } else {
+                    Button("Ignore Containing Folder (\(URL(fileURLWithPath: targetFolder).lastPathComponent))") {
+                        appState.ignoreCleanupFolder(path: targetFolder)
+                    }
+                }
+                Divider()
                 Button("Reveal in Finder") {
                     appState.revealInFinder(path: candidate.location)
                 }
             }
         }
+    }
+
+    private var ignoredExclusionsPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Ignored Cleanup Items & Folders")
+                    .font(.headline)
+                Spacer()
+                if !appState.configuration.cleanupExclusions.isEmpty {
+                    Button("Restore All") {
+                        appState.restoreAllCleanupExclusions()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+                }
+            }
+
+            if appState.configuration.cleanupExclusions.isEmpty {
+                Text("No items or folders are currently ignored. Click the eye-slash icon on any proposal or select items and click 'Ignore Selected' to hide them permanently.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 12)
+            } else {
+                List(appState.configuration.cleanupExclusions) { exclusion in
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(exclusion.label)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                            if let path = exclusion.pathPrefix {
+                                Text(path)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            } else if let cid = exclusion.candidateID {
+                                Text(cid)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        Spacer()
+                        Button("Restore") {
+                            appState.restoreCleanupExclusion(id: exclusion.id)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                }
+                .listStyle(.inset)
+                .frame(height: 240)
+            }
+
+            HStack {
+                Button {
+                    if let folder = appState.chooseFolder(title: "Choose Folder to Permanently Exclude from Cleanup Proposals") {
+                        appState.ignoreCleanupFolder(path: folder)
+                    }
+                } label: {
+                    Label("Exclude Folder…", systemImage: "folder.badge.minus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Spacer()
+                Button("Done") {
+                    showIgnoredPopover = false
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .frame(width: 440)
     }
 
     private func categoryChip(title: String, count: Int, isSelected: Bool, action: @escaping () -> Void) -> some View {

@@ -121,4 +121,23 @@ final class ScanCacheManagerTests: XCTestCase {
         XCTAssertFalse(cleanEntry.isDirty)
         XCTAssertTrue(cleanEntry.minimalDirtyDirectories.isEmpty)
     }
+
+    func testFileSystemWatcherFiltersNoisyAppCachesAndWALFilesAndRollsUpBurstDirtyFolders() {
+        // High-frequency background runtime/cache/WAL files must be ignored so dirty count doesn't spam.
+        XCTAssertTrue(FileSystemWatcher.shouldIgnorePath("/Users/boris/Library/Application Support/Google/Chrome/Default/History-wal"))
+        XCTAssertTrue(FileSystemWatcher.shouldIgnorePath("/Users/boris/Library/Caches/com.google.Chrome/Cache_Data/f_001"))
+        XCTAssertTrue(FileSystemWatcher.shouldIgnorePath("/Users/boris/.gemini/antigravity-cli/brain/transcript.jsonl"))
+        XCTAssertTrue(FileSystemWatcher.shouldIgnorePath("/Users/boris/github.com/app/db.sqlite-shm"))
+        XCTAssertTrue(FileSystemWatcher.shouldIgnorePath("/"))
+
+        // Real user folder changes must NOT be ignored.
+        XCTAssertFalse(FileSystemWatcher.shouldIgnorePath("/Users/boris/Downloads/OldVideos/clip.mp4"))
+        XCTAssertFalse(FileSystemWatcher.shouldIgnorePath("/Users/boris/Documents/report.pdf"))
+        XCTAssertFalse(FileSystemWatcher.shouldIgnorePath("/Volumes/Storage1/Archive/photo.jpg"))
+
+        // Burst of 12 dirty subfolders inside Downloads rolls up cleanly into just Downloads.
+        let burst = (1...12).map { "/Users/boris/Downloads/batch/dir\($0)" }
+        let collapsed = CachedScanEntry.collapseMinimalDirectories(burst, rootPath: "/Users/boris")
+        XCTAssertEqual(collapsed, ["/Users/boris/Downloads"])
+    }
 }
