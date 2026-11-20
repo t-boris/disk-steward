@@ -29,15 +29,75 @@ public struct CleanupScanner: Sendable {
         self.homeDirectory = homeDirectory
     }
 
-    /// Generates a read-only CleanupProposal containing all discovered cleanup opportunities.
+    /// Generates a read-only CleanupProposal containing all discovered cleanup opportunities
+    /// without blocking MainActor or Swift's cooperative thread pool.
     public func discoverProposals(
         configuration: AppConfiguration,
         verifiedArchives: [VerifiedArchiveRecord],
         now: Date = Date()
     ) async -> CleanupProposal {
+        let (fsCandidates, fsNotes): ([CleanupCandidate], [String]) = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let res: ([CleanupCandidate], [String]) = autoreleasepool {
+                    self.discoverFilesystemCandidates(
+                        configuration: configuration,
+                        verifiedArchives: verifiedArchives,
+                        now: now
+                    )
+                }
+                continuation.resume(returning: res)
+            }
+        }
+
+        var candidates = fsCandidates
+        let notes = fsNotes
+
+        // 5. Docker artifacts (images, stopped containers, dangling volumes, build cache)
+        var dockerStatus: String?
+        if configuration.includeDockerCleanup {
+            let dockerResult = await dockerInspector.discoverArtifacts()
+            dockerStatus = dockerResult.statusMessage
+            candidates.append(contentsOf: dockerResult.candidates)
+        } else {
+            dockerStatus = "Docker cleanup inspection is disabled in settings."
+        }
+
+        // Deduplicate by ID and sort largest first within each category.
+        var seenIDs: Set<String> = []
+        let unique = candidates.filter { seenIDs.insert($0.id).inserted }
+            .sorted { lhs, rhs in
+                if lhs.category != rhs.category {
+                    return CleanupCategory.allCases.firstIndex(of: lhs.category)! < CleanupCategory.allCases.firstIndex(of: rhs.category)!
+                }
+                return lhs.estimatedReclaimableBytes > rhs.estimatedReclaimableBytes
+            }
+
+        return CleanupProposal(
+            createdAt: now,
+            candidates: unique,
+            notes: notes,
+            dockerStatusMessage: dockerStatus
+        )
+    }
+
+    private func discoverFilesystemCandidates(
+        configuration: AppConfiguration,
+        verifiedArchives: [VerifiedArchiveRecord],
+        now: Date
+    ) -> ([CleanupCandidate], [String]) {
         var candidates: [CleanupCandidate] = []
         var notes: [String] = []
         var archivedSourcePaths: Set<String> = []
+
+        // 0. Saved User Folder Cleanup Rules (DEC-011)
+        if !configuration.cleanupRules.isEmpty {
+            let ruleEngine = CleanupRuleEngine()
+            for rule in configuration.cleanupRules {
+                let outcome = ruleEngine.evaluate(rule: rule, now: now)
+                candidates.append(contentsOf: outcome.candidates)
+                notes.append(contentsOf: outcome.notes)
+            }
+        }
 
         // 1. Verified Archived Originals (only proposed if archive copy currently exists and passes SHA-256!)
         let archivedCandidates = discoverVerifiedArchivedOriginals(
@@ -69,32 +129,7 @@ public struct CleanupScanner: Sendable {
         let nodeModulesCandidates = discoverNodeModules(roots: configuration.nodeModulesSearchRoots)
         candidates.append(contentsOf: nodeModulesCandidates)
 
-        // 5. Docker artifacts (images, stopped containers, dangling volumes, build cache)
-        var dockerStatus: String?
-        if configuration.includeDockerCleanup {
-            let dockerResult = await dockerInspector.discoverArtifacts()
-            dockerStatus = dockerResult.statusMessage
-            candidates.append(contentsOf: dockerResult.candidates)
-        } else {
-            dockerStatus = "Docker cleanup inspection is disabled in settings."
-        }
-
-        // Deduplicate by ID and sort largest first within each category.
-        var seenIDs: Set<String> = []
-        let unique = candidates.filter { seenIDs.insert($0.id).inserted }
-            .sorted { lhs, rhs in
-                if lhs.category != rhs.category {
-                    return CleanupCategory.allCases.firstIndex(of: lhs.category)! < CleanupCategory.allCases.firstIndex(of: rhs.category)!
-                }
-                return lhs.estimatedReclaimableBytes > rhs.estimatedReclaimableBytes
-            }
-
-        return CleanupProposal(
-            createdAt: now,
-            candidates: unique,
-            notes: notes,
-            dockerStatusMessage: dockerStatus
-        )
+        return (candidates, notes)
     }
 
     private func discoverVerifiedArchivedOriginals(

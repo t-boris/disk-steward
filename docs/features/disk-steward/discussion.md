@@ -71,3 +71,7 @@ confirm
 ### Agent · 2026-11-20
 
 User confirmed implementation policies prior to coding: (1) Confirmed deletion defaults to moving files/directories to macOS Trash with an explicit permanent-delete option in the confirmation dialog; Docker artifacts are removed via Docker CLI (DEC-006). (2) Archive copy verification uses SHA-256; filename collisions skip exact SHA-256 duplicates as already verified-archived and rename differing files with unique numeric suffixes without overwriting (DEC-007). (3) Files not matching any classification rule route to an optional configured fallback folder or remain untouched when no fallback is set (DEC-008). (4) Native Swift/SwiftUI macOS app using SemVer starting at 1.0.0 (VERSION + Info.plist), signed locally and deployed to /Applications/Disk Steward.app (DEC-009).
+
+### Agent · 2026-11-20
+
+User reviewed v1.0.1 and requested two improvements: (1) Replace the flat/monotone treemap and color-mode toggle with a true deep nested structural treemap sized strictly by bytes using vivid contrasting colors for adjacent rectangles, plus quick single-focus category filtering inside any drilled-down folder (DEC-010). (2) Add rule-based folder cleanup allowing the user to target any folder and recursively find/remove matching files by category (e.g. code, videos, archives), extensions (e.g. zip), filename, or age, with confirmation (DEC-011).

@@ -1,3 +1,4 @@
+import AppKit
 import DiskStewardCore
 import SwiftUI
 
@@ -9,12 +10,13 @@ private enum InspectorTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// Visual storage explorer combining a proportional squarified treemap, size/type/date breakdowns,
-/// filters, and explained date-age colors (REQ-003, REQ-004, plan I-3, I-4).
+/// Visual storage explorer with a multi-level structural treemap sized purely by allocated bytes,
+/// folder drill-down, single-focus or combined filters inside any folder, and direct link to rule-based cleanup (REQ-003, REQ-004, DEC-010, DEC-011).
 struct StorageExplorerView: View {
     @EnvironmentObject private var appState: AppState
     @State private var inspectorTab: InspectorTab = .largest
     @State private var showIssuesPopover: Bool = false
+    @State private var customExtInput: String = ""
 
     private let minSizeOptions: [(label: String, bytes: Int64)] = [
         ("Any Size", 0),
@@ -44,24 +46,23 @@ struct StorageExplorerView: View {
                 Divider()
 
                 HSplitView {
-                    // Left: Treemap + Hover Details + Explained Color Legend
+                    // Left: Deep Nested Structural Treemap + Hover Status Strip
                     VStack(spacing: 10) {
                         TreemapView(
                             scopeNode: scope,
-                            colorMode: appState.treemapColorMode,
                             selectedNodeID: appState.selectedNodeID,
                             onHover: { appState.hoveredNode = $0 },
                             onSelect: { appState.selectedNodeID = $0.id },
                             onDrillDown: { appState.drillDown(to: $0) },
-                            onRevealInFinder: { appState.revealInFinder(path: $0) }
+                            onRevealInFinder: { appState.revealInFinder(path: $0) },
+                            onCleanFolderByRule: { appState.openFolderCleanupFromExplorer(folderPath: $0) }
                         )
-                        .frame(minHeight: 300)
+                        .frame(minHeight: 340)
 
                         hoverStatusBar(scope: scope)
-                        colorLegendBar
                     }
                     .padding(14)
-                    .frame(minWidth: 420)
+                    .frame(minWidth: 440)
 
                     // Right: Largest Items / By File Type / By Date Breakdowns
                     VStack(spacing: 10) {
@@ -70,6 +71,7 @@ struct StorageExplorerView: View {
                                 Text(tab.rawValue).tag(tab)
                             }
                         }
+                        .labelsHidden()
                         .pickerStyle(.segmented)
 
                         switch inspectorTab {
@@ -89,9 +91,10 @@ struct StorageExplorerView: View {
                     Image(systemName: "line.3.horizontal.decrease.circle")
                         .font(.system(size: 40))
                         .foregroundStyle(.secondary)
-                    Text("No files match the active filters.")
+                    Text("No files match the active filters in this folder.")
                         .font(.headline)
                     Button("Reset Filters") {
+                        customExtInput = ""
                         appState.resetFilters()
                     }
                     .buttonStyle(.borderedProminent)
@@ -156,14 +159,15 @@ struct StorageExplorerView: View {
 
             Spacer()
 
-            Picker("Colors", selection: $appState.treemapColorMode) {
-                ForEach(TreemapColorMode.allCases) { mode in
-                    Text(mode.displayName).tag(mode)
+            if let scope = appState.unfilteredScopeNode {
+                Button {
+                    appState.openFolderCleanupFromExplorer(folderPath: scope.path)
+                } label: {
+                    Label("Clean Folder by Rule…", systemImage: "wand.and.stars")
                 }
+                .buttonStyle(.bordered)
+                .help("Open Rule-Based Folder Cleanup pre-filled with this folder and active filters")
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 310)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -172,13 +176,12 @@ struct StorageExplorerView: View {
     private var filterBar: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                // Date filter preset
                 Picker("Date", selection: $appState.storageFilter.datePreset) {
                     ForEach(DateFilterPreset.allCases) { preset in
                         Text(preset.displayName).tag(preset)
                     }
                 }
-                .frame(width: 190)
+                .frame(width: 185)
 
                 if appState.storageFilter.datePreset == .custom {
                     DatePicker(
@@ -215,14 +218,30 @@ struct StorageExplorerView: View {
                 }
                 .frame(width: 145)
 
+                TextField("Ext (e.g. zip, mp4)", text: $customExtInput)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 135)
+                    .onChange(of: customExtInput) { _, newValue in
+                        let parsed = newValue
+                            .split(separator: ",")
+                            .map {
+                                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                                    .lowercased()
+                            }
+                            .filter { !$0.isEmpty }
+                        appState.storageFilter.customExtensions = parsed
+                    }
+
                 TextField("Search filename or path…", text: $appState.storageFilter.searchText)
                     .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 160, maxWidth: 240)
+                    .frame(minWidth: 150, maxWidth: 230)
 
                 Spacer()
 
                 if appState.storageFilter.isActive {
                     Button("Clear Filters") {
+                        customExtInput = ""
                         appState.resetFilters()
                     }
                     .buttonStyle(.borderless)
@@ -230,38 +249,56 @@ struct StorageExplorerView: View {
                 }
             }
 
-            // File type multi-select filter chips
+            // Single-click focus category filter chips (Cmd-click to combine multiple categories)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    Text("File Types:")
+                    Text("Filter:")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
+
+                    let allSelected = appState.storageFilter.includedCategories.isEmpty
+                    Button {
+                        appState.storageFilter.includedCategories = []
+                    } label: {
+                        Text("All")
+                            .font(.caption.weight(allSelected ? .semibold : .regular))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 3)
+                            .background(allSelected ? Color.accentColor.opacity(0.24) : Color.primary.opacity(0.06))
+                            .overlay(Capsule().stroke(allSelected ? Color.accentColor : Color.clear, lineWidth: 1))
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
 
                     ForEach(FileCategory.allCases) { category in
                         let selected = appState.storageFilter.includedCategories.contains(category)
                         Button {
-                            if selected {
-                                appState.storageFilter.includedCategories.remove(category)
+                            let isMultiModifier = NSEvent.modifierFlags.contains(.command) || NSEvent.modifierFlags.contains(.shift)
+                            if isMultiModifier {
+                                if selected {
+                                    appState.storageFilter.includedCategories.remove(category)
+                                } else {
+                                    appState.storageFilter.includedCategories.insert(category)
+                                }
                             } else {
-                                appState.storageFilter.includedCategories.insert(category)
+                                // Single-click selects only this category (clicking it again returns to All).
+                                if appState.storageFilter.includedCategories == [category] {
+                                    appState.storageFilter.includedCategories = []
+                                } else {
+                                    appState.storageFilter.includedCategories = [category]
+                                }
                             }
                         } label: {
-                            HStack(spacing: 4) {
-                                Circle()
-                                    .fill(category.colorSpec.swiftUIColor)
-                                    .frame(width: 7, height: 7)
-                                Text(category.displayName)
-                                    .font(.caption)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(selected ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.06))
-                            .overlay(
-                                Capsule().stroke(selected ? Color.accentColor : Color.clear, lineWidth: 1)
-                            )
-                            .clipShape(Capsule())
+                            Text(category.displayName)
+                                .font(.caption.weight(selected ? .semibold : .regular))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 3)
+                                .background(selected ? Color.accentColor.opacity(0.24) : Color.primary.opacity(0.06))
+                                .overlay(Capsule().stroke(selected ? Color.accentColor : Color.clear, lineWidth: 1))
+                                .clipShape(Capsule())
                         }
                         .buttonStyle(.plain)
+                        .help("Click to filter only \(category.displayName); ⌘-click to combine multiple types")
                     }
                 }
             }
@@ -365,7 +402,7 @@ struct StorageExplorerView: View {
 
             Text("\(ByteFormatting.string(from: scope.allocatedSize)) • \(scope.fileCount.formatted()) file(s)")
                 .font(.caption.weight(.semibold).monospacedDigit())
-            Text("• Size: Allocated on-disk • Date: Last modified")
+            Text("• Sized by allocated disk space")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -383,13 +420,16 @@ struct StorageExplorerView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
-                Text("Allocated: \(ByteFormatting.string(from: hovered.allocatedSize))")
+                let pct = scope.allocatedSize > 0
+                    ? ByteFormatting.percentString(Double(hovered.allocatedSize) / Double(scope.allocatedSize))
+                    : "0%"
+                Text("\(ByteFormatting.string(from: hovered.allocatedSize)) (\(pct))")
                     .font(.caption.weight(.semibold).monospacedDigit())
-                Text("• Modified: \(hovered.modifiedDate.formatted(date: .abbreviated, time: .omitted)) (\(hovered.ageBucket().displayName))")
+                Text("• \(hovered.isDirectory ? "\(hovered.fileCount.formatted()) files" : hovered.category.displayName) • \(hovered.modifiedDate.formatted(date: .abbreviated, time: .omitted))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                Text("Hover a rectangle to inspect details. Click a folder to drill down; right-click to reveal in Finder.")
+                Text("Nested rectangles are sized strictly by allocated disk space. Click any folder to zoom in; right-click to clean by rule or reveal in Finder.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -406,44 +446,6 @@ struct StorageExplorerView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
-    /// Always-visible color explanation legend (REQ-004 AC 3).
-    private var colorLegendBar: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text(appState.treemapColorMode == .byDateAge ? "Date Age Color Legend (Last Modified Date):" : "File Type Color Legend:")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            let specs = appState.treemapColorMode == .byDateAge
-                ? StorageAnalyzer.dateColorLegend
-                : StorageAnalyzer.categoryColorLegend
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ForEach(specs, id: \.label) { spec in
-                        HStack(spacing: 5) {
-                            RoundedRectangle(cornerRadius: 3)
-                                .fill(spec.swiftUIColor)
-                                .frame(width: 12, height: 12)
-                            Text(spec.label)
-                                .font(.caption.weight(.medium))
-                        }
-                        .help(spec.explanation)
-                    }
-                }
-            }
-            if appState.treemapColorMode == .byDateAge {
-                Text("Cool blue indicates recently modified files (< 7 days); amber and coral highlight older files (> 6 months / > 1 year) that are strong candidates for archiving or cleanup.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
     // MARK: - Right Inspector Views
 
     private func largestItemsList(scope: StorageNode) -> some View {
@@ -453,11 +455,6 @@ struct StorageExplorerView: View {
         return List(items) { item in
             let frac = Double(item.allocatedSize) / Double(scopeTotal)
             HStack(spacing: 8) {
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(item.ageBucket().colorSpec.swiftUIColor)
-                    .frame(width: 5, height: 28)
-                    .help(item.ageBucket().colorSpec.explanation)
-
                 Image(systemName: item.category.systemImage)
                     .foregroundStyle(.secondary)
                     .frame(width: 18)
@@ -492,6 +489,10 @@ struct StorageExplorerView: View {
                 Button("Reveal in Finder") {
                     appState.revealInFinder(path: item.path)
                 }
+                let parent = URL(fileURLWithPath: item.path).deletingLastPathComponent().path
+                Button("Clean Containing Folder by Rule…") {
+                    appState.openFolderCleanupFromExplorer(folderPath: parent)
+                }
             }
         }
         .listStyle(.inset)
@@ -502,9 +503,8 @@ struct StorageExplorerView: View {
         return List(rows) { row in
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Circle()
-                        .fill(row.category.colorSpec.swiftUIColor)
-                        .frame(width: 9, height: 9)
+                    Image(systemName: row.category.systemImage)
+                        .foregroundStyle(.secondary)
                     Text(row.category.displayName)
                         .font(.subheadline.weight(.medium))
                     Spacer()
@@ -512,7 +512,7 @@ struct StorageExplorerView: View {
                         .font(.subheadline.weight(.semibold).monospacedDigit())
                 }
                 ProgressView(value: row.fraction)
-                    .tint(row.category.colorSpec.swiftUIColor)
+                    .tint(.accentColor)
                 HStack {
                     Text("\(row.fileCount.formatted()) file(s)")
                     Spacer()
@@ -536,32 +536,34 @@ struct StorageExplorerView: View {
 
     private func dateBreakdownView(scope: StorageNode) -> some View {
         let rows = StorageAnalyzer.ageBreakdown(in: scope)
-        return List(rows) { row in
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(row.bucket.colorSpec.swiftUIColor)
-                        .frame(width: 12, height: 12)
-                    Text(row.bucket.displayName)
-                        .font(.subheadline.weight(.medium))
-                    Spacer()
-                    Text(ByteFormatting.string(from: row.totalBytes))
-                        .font(.subheadline.weight(.semibold).monospacedDigit())
+        return VStack(spacing: 0) {
+            List(rows) { row in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(row.bucket.colorSpec.swiftUIColor)
+                            .frame(width: 12, height: 12)
+                        Text(row.bucket.displayName)
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                        Text(ByteFormatting.string(from: row.totalBytes))
+                            .font(.subheadline.weight(.semibold).monospacedDigit())
+                    }
+                    ProgressView(value: row.fraction)
+                        .tint(row.bucket.colorSpec.swiftUIColor)
+                    HStack {
+                        Text(row.bucket.colorSpec.explanation)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(row.fileCount.formatted()) file(s) • \(ByteFormatting.percentString(row.fraction))")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                 }
-                ProgressView(value: row.fraction)
-                    .tint(row.bucket.colorSpec.swiftUIColor)
-                HStack {
-                    Text(row.bucket.colorSpec.explanation)
-                        .lineLimit(1)
-                    Spacer()
-                    Text("\(row.fileCount.formatted()) file(s) • \(ByteFormatting.percentString(row.fraction))")
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                .padding(.vertical, 3)
             }
-            .padding(.vertical, 3)
+            .listStyle(.inset)
         }
-        .listStyle(.inset)
     }
 
     private var emptyExplorerState: some View {
@@ -571,7 +573,7 @@ struct StorageExplorerView: View {
                 .foregroundStyle(Color.accentColor)
             Text("Visual Storage Explorer")
                 .font(.title2.weight(.semibold))
-            Text("Select a disk or folder and click Scan to visualize space usage as a proportional treemap with size, file-type, and date breakdowns.")
+            Text("Select a disk or folder and click Scan to explore nested storage hierarchy sized proportionally by allocated space.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

@@ -1,5 +1,4 @@
 import Foundation
-import UniformTypeIdentifiers
 
 /// High-level file classification used for storage breakdowns, filters, and archive routing.
 public enum FileCategory: String, CaseIterable, Codable, Sendable, Identifiable {
@@ -96,44 +95,54 @@ public enum FileCategory: String, CaseIterable, Codable, Sendable, Identifiable 
         "log", "cache", "tmp", "temp", "swp", "bak", "dmp", "crash", "ips"
     ]
 
-    /// Classifies a file using extension, path hints, and UTType fallback.
+    private static let extensionLookup: [String: FileCategory] = {
+        var map: [String: FileCategory] = [:]
+        for e in installerExtensions { map[e] = .installers }
+        for e in imageExtensions { map[e] = .images }
+        for e in videoExtensions { map[e] = .videos }
+        for e in audioExtensions { map[e] = .audio }
+        for e in archiveExtensions { map[e] = .archives }
+        for e in documentExtensions { map[e] = .documents }
+        for e in codeExtensions { map[e] = .code }
+        for e in cacheLogExtensions { map[e] = .cachesAndLogs }
+        // Additional common extensions to avoid LaunchServices UTType XPC overhead on large disk scans.
+        for e in ["phtml", "vue", "svelte", "astro", "mjs", "cjs", "mts", "cts", "lua", "pl", "pm", "r", "scala", "dart", "ex", "exs", "erl", "zig", "nim", "v", "sol", "tf", "hcl", "ini", "cfg", "conf", "env", "lock", "cmake", "ninja", "bazel", "bzl"] {
+            map[e] = .code
+        }
+        for e in ["m4v", "vob", "ogv", "rmvb", "f4v", "asf", "dv"] { map[e] = .videos }
+        for e in ["caf", "amr", "au", "ra", "wv", "ape", "dsf"] { map[e] = .audio }
+        for e in ["eps", "ai", "sketch", "fig", "xcf", "jxl", "jp2", "exr", "hdr", "icns"] { map[e] = .images }
+        for e in ["war", "ear", "jar", "cpio", "lzma", "lz", "sit", "sitx", "ace", "arj"] { map[e] = .archives }
+        for e in ["tex", "bib", "djvu", "fb2", "azw", "azw3", "chm", "rst", "adoc", "org"] { map[e] = .documents }
+        return map
+    }()
+
+    /// Fast pure-memory file classification avoiding LaunchServices XPC overhead during full-disk scans.
     public static func classify(url: URL, isDirectory: Bool = false) -> FileCategory {
+        classify(fileName: url.lastPathComponent, path: url.path, isDirectory: isDirectory)
+    }
+
+    public static func classify(fileName: String, path: String, isDirectory: Bool = false) -> FileCategory {
         if isDirectory {
-            let lower = url.lastPathComponent.lowercased()
+            let lower = fileName.lowercased()
             if lower == "caches" || lower == "cache" || lower == ".cache" || lower == "deriveddata" {
                 return .cachesAndLogs
             }
             return .other
         }
 
-        let ext = url.pathExtension.lowercased()
-        let fileName = url.lastPathComponent.lowercased()
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        if !ext.isEmpty, let matched = extensionLookup[ext] {
+            return matched
+        }
 
-        if installerExtensions.contains(ext) { return .installers }
-        if imageExtensions.contains(ext) { return .images }
-        if videoExtensions.contains(ext) { return .videos }
-        if audioExtensions.contains(ext) { return .audio }
-        if archiveExtensions.contains(ext) { return .archives }
-        if documentExtensions.contains(ext) { return .documents }
-        if codeExtensions.contains(ext) || fileName == "dockerfile" || fileName == "makefile" || fileName == "package.json" {
+        let lowerName = fileName.lowercased()
+        if lowerName == "dockerfile" || lowerName == "makefile" || lowerName == "gemfile" || lowerName == "podfile" || lowerName == "rakefile" {
             return .code
         }
-        if cacheLogExtensions.contains(ext) { return .cachesAndLogs }
 
-        let pathLower = url.path.lowercased()
-        if pathLower.contains("/caches/") || pathLower.contains("/logs/") {
+        if path.contains("/Caches/") || path.contains("/Logs/") || path.contains("/caches/") || path.contains("/logs/") {
             return .cachesAndLogs
-        }
-
-        if !ext.isEmpty, let utType = UTType(filenameExtension: ext) {
-            if utType.conforms(to: .image) { return .images }
-            if utType.conforms(to: .movie) || utType.conforms(to: .video) { return .videos }
-            if utType.conforms(to: .audio) { return .audio }
-            if utType.conforms(to: .archive) { return .archives }
-            if utType.conforms(to: .sourceCode) { return .code }
-            if utType.conforms(to: .pdf) || utType.conforms(to: .text) || utType.conforms(to: .spreadsheet) || utType.conforms(to: .presentation) {
-                return .documents
-            }
         }
 
         return .other

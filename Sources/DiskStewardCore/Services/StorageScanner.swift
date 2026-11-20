@@ -43,19 +43,66 @@ public struct StorageScanner: Sendable {
         return true
     }
 
-    /// Scans `rootURL` asynchronously. Reports periodic `ScanProgress` updates and handles Task cancellation gracefully.
+    /// Thread-safe cancellation bridge so blocking POSIX/FileManager I/O on a utility DispatchQueue
+    /// responds immediately to Swift Task cancellation without starving the cooperative pool.
+    private final class AtomicCancelFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            let v = cancelled
+            lock.unlock()
+            return v
+        }
+    }
+
+    /// Scans `rootURL` asynchronously on a dedicated utility background queue (never blocking MainActor
+    /// or Swift's cooperative thread pool). Reports throttled `ScanProgress` updates and honors cancellation immediately.
     public func scan(
         rootURL: URL,
         stayOnSameVolume: Bool = true,
         progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> ScanResult {
+        let cancelFlag = AtomicCancelFlag()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    let result = autoreleasepool {
+                        self.scanSync(
+                            rootURL: rootURL,
+                            stayOnSameVolume: stayOnSameVolume,
+                            cancelFlag: cancelFlag,
+                            progressHandler: progressHandler
+                        )
+                    }
+                    continuation.resume(returning: result)
+                }
+            }
+        } onCancel: {
+            cancelFlag.cancel()
+        }
+    }
+
+    private func scanSync(
+        rootURL: URL,
+        stayOnSameVolume: Bool,
+        cancelFlag: AtomicCancelFlag,
+        progressHandler: (@Sendable (ScanProgress) -> Void)?
+    ) -> ScanResult {
         let start = Date()
         let standardizedRoot = rootURL.standardizedFileURL
 
         let rootValues = try? standardizedRoot.resourceValues(forKeys: Self.resourceKeys)
         let rootVolumeID = rootValues?.volumeIdentifier as? NSObject
 
-        let state = TraversalState()
+        let state = TraversalState(cancelFlag: cancelFlag)
         if let rootDirID = Self.identifierData(from: rootValues?.fileResourceIdentifier) {
             state.seenDirectoryIDs.insert(rootDirID)
         }
@@ -82,6 +129,7 @@ public struct StorageScanner: Sendable {
     }
 
     private final class TraversalState {
+        let cancelFlag: AtomicCancelFlag
         var filesScanned = 0
         var directoriesScanned = 0
         var bytesAccumulated: Int64 = 0
@@ -89,7 +137,12 @@ public struct StorageScanner: Sendable {
         var wasCancelled = false
         var seenHardLinkIDs: Set<Data> = []
         var seenDirectoryIDs: Set<Data> = []
-        var lastProgressReport = Date.distantPast
+        var lastProgressReportTime: CFAbsoluteTime = 0
+        var itemsSinceProgressCheck = 0
+
+        init(cancelFlag: AtomicCancelFlag) {
+            self.cancelFlag = cancelFlag
+        }
     }
 
     private static func identifierData(from raw: Any?) -> Data? {
@@ -109,7 +162,7 @@ public struct StorageScanner: Sendable {
         state: TraversalState,
         progressHandler: (@Sendable (ScanProgress) -> Void)?
     ) -> StorageNode {
-        if Task.isCancelled {
+        if state.cancelFlag.isCancelled {
             state.wasCancelled = true
             return StorageNode(
                 name: displayName(for: url),
@@ -130,11 +183,13 @@ public struct StorageScanner: Sendable {
         let fm = FileManager.default
         let entries: [URL]
         do {
-            entries = try fm.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: Array(Self.resourceKeys),
-                options: []
-            )
+            entries = try autoreleasepool {
+                try fm.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: Array(Self.resourceKeys),
+                    options: []
+                )
+            }
         } catch {
             state.issues.append(ScanIssue(path: url.path, reason: error.localizedDescription))
             let dirMod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
@@ -162,13 +217,14 @@ public struct StorageScanner: Sendable {
         var hasInaccessible = false
 
         for entry in entries {
-            if Task.isCancelled {
+            if state.cancelFlag.isCancelled {
                 state.wasCancelled = true
                 hasInaccessible = true
                 break
             }
 
-            let entryPath = entry.standardizedFileURL.path
+            let entryPath = entry.path
+            let entryName = entry.lastPathComponent
 
             // Prevent macOS kernel portal (/.nofollow, /.resolve, /.vol) and firmlink/mount recursion.
             if Self.shouldSkipVirtualPath(entryPath, rootPath: rootPath) {
@@ -189,7 +245,7 @@ public struct StorageScanner: Sendable {
                 let linkSize = Int64(values.fileSize ?? 0)
                 let mod = values.contentModificationDate ?? Date()
                 let node = StorageNode(
-                    name: entry.lastPathComponent,
+                    name: entryName,
                     path: entryPath,
                     isDirectory: false,
                     allocatedSize: 0,
@@ -224,7 +280,7 @@ public struct StorageScanner: Sendable {
                 }
 
                 let childDir = traverseDirectory(
-                    url: entry.standardizedFileURL,
+                    url: entry,
                     rootPath: rootPath,
                     rootVolumeID: rootVolumeID,
                     stayOnSameVolume: stayOnSameVolume,
@@ -261,9 +317,9 @@ public struct StorageScanner: Sendable {
                 }
 
                 let mod = values.contentModificationDate ?? Date()
-                let category = FileCategory.classify(url: entry, isDirectory: false)
+                let category = FileCategory.classify(fileName: entryName, path: entryPath, isDirectory: false)
                 let fileNode = StorageNode(
-                    name: entry.lastPathComponent,
+                    name: entryName,
                     path: entryPath,
                     isDirectory: false,
                     allocatedSize: allocated,
@@ -284,18 +340,22 @@ public struct StorageScanner: Sendable {
             }
 
             if let progressHandler {
-                let now = Date()
-                if now.timeIntervalSince(state.lastProgressReport) >= 0.12 {
-                    state.lastProgressReport = now
-                    progressHandler(
-                        ScanProgress(
-                            currentPath: entryPath,
-                            filesScanned: state.filesScanned,
-                            directoriesScanned: state.directoriesScanned,
-                            bytesAccumulated: state.bytesAccumulated,
-                            issuesCount: state.issues.count
+                state.itemsSinceProgressCheck += 1
+                if state.itemsSinceProgressCheck >= 512 {
+                    state.itemsSinceProgressCheck = 0
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - state.lastProgressReportTime >= 0.15 {
+                        state.lastProgressReportTime = now
+                        progressHandler(
+                            ScanProgress(
+                                currentPath: entryPath,
+                                filesScanned: state.filesScanned,
+                                directoriesScanned: state.directoriesScanned,
+                                bytesAccumulated: state.bytesAccumulated,
+                                issuesCount: state.issues.count
+                            )
                         )
-                    )
+                    }
                 }
             }
         }

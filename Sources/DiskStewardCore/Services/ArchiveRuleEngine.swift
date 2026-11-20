@@ -93,16 +93,28 @@ public struct ArchiveRuleEngine: Sendable {
         return text.range(of: regex, options: .regularExpression) != nil
     }
 
-    /// Builds a dry-run classified archive plan for `job` without modifying any files (plan I-5).
-    public func buildPlan(
+    /// Lightweight routed file item without pre-computing collision SHA-256 hashes (used by ArchiveExecutor to avoid double-hashing).
+    public struct RoutedArchiveItem: Sendable {
+        public let sourcePath: String
+        public let sourceRootPath: String
+        public let fileName: String
+        public let fileSize: Int64
+        public let category: FileCategory
+        public let matchedRuleName: String?
+        public let desiredDestinationPath: String?
+        public let isDestinationUnavailable: Bool
+        public let isUnmatched: Bool
+    }
+
+    /// Routes all source files in `job` through classification rules without performing SHA-256 hashing.
+    public func routeFiles(
         for job: ArchiveJob,
         mountedVolumePaths: Set<String>? = nil
-    ) -> ArchivePlan {
+    ) -> (items: [RoutedArchiveItem], unavailableDestinations: [String], scanErrors: [String]) {
         let fm = FileManager.default
-        var entries: [ArchivePlanEntry] = []
+        var items: [RoutedArchiveItem] = []
         var unavailableDestinations: Set<String> = []
         var scanErrors: [String] = []
-        var claimedDestinations: [String: String] = [:] // destPath -> sourceSHA256 (if computed)
 
         for sourceFolder in job.sourceFolders {
             let rootURL = URL(fileURLWithPath: sourceFolder).standardizedFileURL
@@ -119,85 +131,156 @@ public struct ArchiveRuleEngine: Sendable {
             )
 
             for fileURL in files {
-                let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .totalFileAllocatedSizeKey])
-                let fileSize = Int64(values?.fileSize ?? values?.totalFileAllocatedSize ?? 0)
-                let category = FileCategory.classify(url: fileURL, isDirectory: false)
+                autoreleasepool {
+                    let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .totalFileAllocatedSizeKey])
+                    let fileSize = Int64(values?.fileSize ?? values?.totalFileAllocatedSize ?? 0)
+                    let fileName = fileURL.lastPathComponent
+                    let category = FileCategory.classify(fileName: fileName, path: fileURL.path, isDirectory: false)
 
-                let matchedRule = matchingRule(for: fileURL, category: category, in: job.rules)
-                let destFolder: String?
-                let matchedName: String?
-                let preserveRelative: Bool
+                    let matchedRule = matchingRule(for: fileURL, category: category, in: job.rules)
+                    let destFolder: String?
+                    let matchedName: String?
+                    let preserveRelative: Bool
 
-                if let rule = matchedRule {
-                    destFolder = rule.destinationFolderPath
-                    matchedName = rule.name
-                    preserveRelative = rule.preserveRelativeSubpath
-                } else if let fallback = job.fallbackDestinationPath, !fallback.isEmpty {
-                    destFolder = fallback
-                    matchedName = "Fallback Destination"
-                    preserveRelative = false
-                } else {
-                    // DEC-008: Unmatched files remain untouched when no fallback folder is configured.
-                    entries.append(
-                        ArchivePlanEntry(
+                    if let rule = matchedRule {
+                        destFolder = rule.destinationFolderPath
+                        matchedName = rule.name
+                        preserveRelative = rule.preserveRelativeSubpath
+                    } else if let fallback = job.fallbackDestinationPath, !fallback.isEmpty {
+                        destFolder = fallback
+                        matchedName = "Fallback Destination"
+                        preserveRelative = false
+                    } else {
+                        items.append(
+                            RoutedArchiveItem(
+                                sourcePath: fileURL.path,
+                                sourceRootPath: rootURL.path,
+                                fileName: fileName,
+                                fileSize: fileSize,
+                                category: category,
+                                matchedRuleName: nil,
+                                desiredDestinationPath: nil,
+                                isDestinationUnavailable: false,
+                                isUnmatched: true
+                            )
+                        )
+                        return
+                    }
+
+                    guard let destinationBase = destFolder else { return }
+
+                    if !VolumeMonitor.isDestinationVolumeAvailable(destinationBase, mountedVolumePaths: mountedVolumePaths) {
+                        unavailableDestinations.insert(destinationBase)
+                        items.append(
+                            RoutedArchiveItem(
+                                sourcePath: fileURL.path,
+                                sourceRootPath: rootURL.path,
+                                fileName: fileName,
+                                fileSize: fileSize,
+                                category: category,
+                                matchedRuleName: matchedName,
+                                desiredDestinationPath: destinationBase,
+                                isDestinationUnavailable: true,
+                                isUnmatched: false
+                            )
+                        )
+                        return
+                    }
+
+                    let targetDirURL = computeTargetDirectory(
+                        destinationBase: destinationBase,
+                        fileURL: fileURL,
+                        sourceRootURL: rootURL,
+                        preserveRelativeSubpath: preserveRelative
+                    )
+                    let initialDestURL = targetDirURL.appendingPathComponent(fileName)
+                    items.append(
+                        RoutedArchiveItem(
                             sourcePath: fileURL.path,
                             sourceRootPath: rootURL.path,
-                            fileName: fileURL.lastPathComponent,
+                            fileName: fileName,
                             fileSize: fileSize,
                             category: category,
+                            matchedRuleName: matchedName,
+                            desiredDestinationPath: initialDestURL.path,
+                            isDestinationUnavailable: false,
+                            isUnmatched: false
+                        )
+                    )
+                }
+            }
+        }
+
+        for dest in job.configuredDestinations {
+            if !VolumeMonitor.isDestinationVolumeAvailable(dest, mountedVolumePaths: mountedVolumePaths) {
+                unavailableDestinations.insert(dest)
+            }
+        }
+
+        return (items, Array(unavailableDestinations).sorted(), scanErrors)
+    }
+
+    /// Builds a dry-run classified archive plan for `job` without modifying any files (plan I-5).
+    public func buildPlan(
+        for job: ArchiveJob,
+        mountedVolumePaths: Set<String>? = nil
+    ) -> ArchivePlan {
+        let routed = routeFiles(for: job, mountedVolumePaths: mountedVolumePaths)
+        var entries: [ArchivePlanEntry] = []
+        entries.reserveCapacity(routed.items.count)
+        var claimedDestinations: [String: String] = [:]
+        var existingHashCache: [String: String] = [:]
+
+        for item in routed.items {
+            autoreleasepool {
+                if item.isUnmatched {
+                    entries.append(
+                        ArchivePlanEntry(
+                            sourcePath: item.sourcePath,
+                            sourceRootPath: item.sourceRootPath,
+                            fileName: item.fileName,
+                            fileSize: item.fileSize,
+                            category: item.category,
                             matchedRuleName: nil,
                             destinationPath: nil,
                             action: .skipUnmatched,
                             note: "No classification rule matched and no fallback folder is configured"
                         )
                     )
-                    continue
+                    return
                 }
-
-                guard let destinationBase = destFolder else { continue }
-
-                // Check destination volume availability (DEC-004).
-                if !VolumeMonitor.isDestinationVolumeAvailable(destinationBase, mountedVolumePaths: mountedVolumePaths) {
-                    unavailableDestinations.insert(destinationBase)
+                if item.isDestinationUnavailable {
                     entries.append(
                         ArchivePlanEntry(
-                            sourcePath: fileURL.path,
-                            sourceRootPath: rootURL.path,
-                            fileName: fileURL.lastPathComponent,
-                            fileSize: fileSize,
-                            category: category,
-                            matchedRuleName: matchedName,
-                            destinationPath: destinationBase,
+                            sourcePath: item.sourcePath,
+                            sourceRootPath: item.sourceRootPath,
+                            fileName: item.fileName,
+                            fileSize: item.fileSize,
+                            category: item.category,
+                            matchedRuleName: item.matchedRuleName,
+                            destinationPath: item.desiredDestinationPath,
                             action: .destinationUnavailable,
                             note: "Destination disk is currently unavailable"
                         )
                     )
-                    continue
+                    return
                 }
-
-                let targetDirURL = computeTargetDirectory(
-                    destinationBase: destinationBase,
-                    fileURL: fileURL,
-                    sourceRootURL: rootURL,
-                    preserveRelativeSubpath: preserveRelative
-                )
-                let initialDestURL = targetDirURL.appendingPathComponent(fileURL.lastPathComponent)
-
-                // Collision resolution (DEC-007)
+                guard let destPath = item.desiredDestinationPath else { return }
                 let resolution = resolveDestination(
-                    sourceURL: fileURL,
-                    desiredDestinationURL: initialDestURL,
-                    claimedDestinations: &claimedDestinations
+                    sourceURL: URL(fileURLWithPath: item.sourcePath),
+                    sourceFileSize: item.fileSize,
+                    desiredDestinationURL: URL(fileURLWithPath: destPath),
+                    claimedDestinations: &claimedDestinations,
+                    existingHashCache: &existingHashCache
                 )
-
                 entries.append(
                     ArchivePlanEntry(
-                        sourcePath: fileURL.path,
-                        sourceRootPath: rootURL.path,
-                        fileName: fileURL.lastPathComponent,
-                        fileSize: fileSize,
-                        category: category,
-                        matchedRuleName: matchedName,
+                        sourcePath: item.sourcePath,
+                        sourceRootPath: item.sourceRootPath,
+                        fileName: item.fileName,
+                        fileSize: item.fileSize,
+                        category: item.category,
+                        matchedRuleName: item.matchedRuleName,
                         destinationPath: resolution.destinationURL.path,
                         action: resolution.action,
                         note: resolution.note
@@ -206,20 +289,12 @@ public struct ArchiveRuleEngine: Sendable {
             }
         }
 
-        // Also inspect configured destination paths even when no files currently matched,
-        // so unavailable external archive disks are still surfaced clearly.
-        for dest in job.configuredDestinations {
-            if !VolumeMonitor.isDestinationVolumeAvailable(dest, mountedVolumePaths: mountedVolumePaths) {
-                unavailableDestinations.insert(dest)
-            }
-        }
-
         return ArchivePlan(
             jobID: job.id,
             jobName: job.name,
             entries: entries,
-            unavailableDestinations: Array(unavailableDestinations).sorted(),
-            scanErrors: scanErrors
+            unavailableDestinations: routed.unavailableDestinations,
+            scanErrors: routed.scanErrors
         )
     }
 
@@ -230,15 +305,17 @@ public struct ArchiveRuleEngine: Sendable {
         public let note: String?
     }
 
-    /// Resolves destination filename collisions per DEC-007:
+    /// Resolves destination filename collisions per DEC-007 with fast file-size pre-filtering and hash caching:
     /// - If destination does not exist (and isn't claimed in this batch): `.copy`
-    /// - If existing file has identical SHA-256: `.skipDuplicate`
+    /// - If existing file has identical size AND identical SHA-256: `.skipDuplicate`
     /// - If existing file differs: generates unique numeric suffix `name (2).ext`, `name (3).ext`, ...
     public func resolveDestination(
         sourceURL: URL,
+        sourceFileSize: Int64? = nil,
         desiredDestinationURL: URL,
         sourceSHA256: String? = nil,
-        claimedDestinations: inout [String: String]
+        claimedDestinations: inout [String: String],
+        existingHashCache: inout [String: String]
     ) -> DestinationResolution {
         let fm = FileManager.default
         let desiredPath = desiredDestinationURL.standardizedFileURL.path
@@ -253,33 +330,55 @@ public struct ArchiveRuleEngine: Sendable {
             )
         }
 
-        let computedSourceHash: String?
-        if let provided = sourceSHA256 {
-            computedSourceHash = provided
-        } else {
-            computedSourceHash = try? FileHasher.sha256(of: sourceURL)
+        let resolvedSourceSize: Int64 = sourceFileSize
+            ?? Int64((try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? -1)
+
+        var computedSourceHash: String? = sourceSHA256
+        func getSourceHash() -> String? {
+            if computedSourceHash == nil {
+                computedSourceHash = try? FileHasher.sha256(of: sourceURL)
+            }
+            return computedSourceHash
+        }
+
+        func existingMatchesSource(at url: URL, path: String) -> String? {
+            // Fast path: files with different byte sizes can never have the same SHA-256.
+            if resolvedSourceSize >= 0,
+               let existingSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+               Int64(existingSize) != resolvedSourceSize {
+                return nil
+            }
+            guard let srcHash = getSourceHash() else { return nil }
+            let existingHash: String?
+            if let cached = existingHashCache[path] {
+                existingHash = cached
+            } else if let computed = try? FileHasher.sha256(of: url) {
+                existingHashCache[path] = computed
+                existingHash = computed
+            } else {
+                existingHash = nil
+            }
+            return (existingHash == srcHash) ? srcHash : nil
         }
 
         // Check desired path first for exact SHA-256 match.
-        if let srcHash = computedSourceHash {
-            if fm.fileExists(atPath: desiredPath),
-               let existingHash = try? FileHasher.sha256(of: desiredDestinationURL),
-               existingHash == srcHash {
+        if fm.fileExists(atPath: desiredPath) {
+            if let matchedHash = existingMatchesSource(at: desiredDestinationURL, path: desiredPath) {
                 return DestinationResolution(
                     destinationURL: desiredDestinationURL,
                     action: .skipDuplicate,
-                    matchedExistingSHA256: existingHash,
+                    matchedExistingSHA256: matchedHash,
                     note: "Identical file already exists in destination (SHA-256 verified)"
                 )
             }
-            if let claimedHash = claimedDestinations[desiredPath], !claimedHash.isEmpty, claimedHash == srcHash {
-                return DestinationResolution(
-                    destinationURL: desiredDestinationURL,
-                    action: .skipDuplicate,
-                    matchedExistingSHA256: claimedHash,
-                    note: "Identical file already scheduled for this destination in the same run"
-                )
-            }
+        } else if let claimedHash = claimedDestinations[desiredPath], !claimedHash.isEmpty,
+                  let srcHash = getSourceHash(), claimedHash == srcHash {
+            return DestinationResolution(
+                destinationURL: desiredDestinationURL,
+                action: .skipDuplicate,
+                matchedExistingSHA256: claimedHash,
+                note: "Identical file already scheduled for this destination in the same run"
+            )
         }
 
         // Different content: search numbered suffixes `name (2).ext`, `name (3).ext`, ...
@@ -296,13 +395,11 @@ public struct ArchiveRuleEngine: Sendable {
             let candidatePath = candidateURL.standardizedFileURL.path
 
             if fm.fileExists(atPath: candidatePath) {
-                if let srcHash = computedSourceHash,
-                   let existingHash = try? FileHasher.sha256(of: candidateURL),
-                   existingHash == srcHash {
+                if let matchedHash = existingMatchesSource(at: candidateURL, path: candidatePath) {
                     return DestinationResolution(
                         destinationURL: candidateURL,
                         action: .skipDuplicate,
-                        matchedExistingSHA256: existingHash,
+                        matchedExistingSHA256: matchedHash,
                         note: "Identical copy already exists as \(candidateName) (SHA-256 verified)"
                     )
                 }
@@ -311,7 +408,8 @@ public struct ArchiveRuleEngine: Sendable {
             }
 
             if claimedDestinations[candidatePath] != nil {
-                if let srcHash = computedSourceHash, claimedDestinations[candidatePath] == srcHash {
+                if let claimedHash = claimedDestinations[candidatePath], !claimedHash.isEmpty,
+                   let srcHash = getSourceHash(), claimedHash == srcHash {
                     return DestinationResolution(
                         destinationURL: candidateURL,
                         action: .skipDuplicate,
@@ -332,7 +430,6 @@ public struct ArchiveRuleEngine: Sendable {
             )
         }
 
-        // Fallback unreachable in practice
         let uuidName = ext.isEmpty ? "\(baseName)-\(UUID().uuidString.prefix(8))" : "\(baseName)-\(UUID().uuidString.prefix(8)).\(ext)"
         let fallbackURL = dirURL.appendingPathComponent(uuidName)
         claimedDestinations[fallbackURL.path] = computedSourceHash ?? ""
@@ -408,13 +505,15 @@ public struct ArchiveRuleEngine: Sendable {
         }
 
         for case let fileURL as URL in enumerator {
-            let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            if values?.isSymbolicLink == true {
-                enumerator.skipDescendants()
-                continue
-            }
-            if values?.isRegularFile == true {
-                results.append(fileURL.standardizedFileURL)
+            autoreleasepool {
+                let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                if values?.isSymbolicLink == true {
+                    enumerator.skipDescendants()
+                    return
+                }
+                if values?.isRegularFile == true {
+                    results.append(fileURL.standardizedFileURL)
+                }
             }
         }
         scanErrors.append(contentsOf: collectedErrors)

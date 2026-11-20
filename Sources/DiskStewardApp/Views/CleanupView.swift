@@ -1,15 +1,34 @@
 import DiskStewardCore
 import SwiftUI
 
-/// Presents automatically discovered cleanup proposals across archived originals, user files,
-/// caches, Docker artifacts, and node_modules, requiring explicit user confirmation before any deletion (REQ-006, DEC-003).
+/// Presents both rule-based recursive folder cleanup (DEC-011) and automatically discovered cleanup proposals
+/// across archived originals, user files, caches, Docker artifacts, and node_modules, requiring explicit
+/// confirmation before any deletion (REQ-006, DEC-003, DEC-006).
 struct CleanupView: View {
     @EnvironmentObject private var appState: AppState
-    @State private var selectedCategory: CleanupCategory? = nil
     @State private var showSettingsPopover: Bool = false
+    @State private var showRuleBuilder: Bool = true
+    @State private var extensionsInput: String = "zip"
+
+    private let ageOptions: [(label: String, days: Int?)] = [
+        ("Any age", nil),
+        ("Older than 7 days", 7),
+        ("Older than 30 days", 30),
+        ("Older than 90 days", 90),
+        ("Older than 1 year", 365)
+    ]
+
+    private let minSizeOptions: [(label: String, bytes: Int64)] = [
+        ("Any size", 0),
+        (">= 1 MB", 1_000_000),
+        (">= 10 MB", 10_000_000),
+        (">= 100 MB", 100_000_000)
+    ]
 
     private var visibleCategories: [CleanupCategory] {
-        if let selectedCategory { return [selectedCategory] }
+        if let selected = appState.cleanupActiveCategoryFilter {
+            return [selected]
+        }
         return CleanupCategory.allCases
     }
 
@@ -18,14 +37,23 @@ struct CleanupView: View {
             // Header
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Disk Cleanup Proposals")
+                    Text("Disk Cleanup")
                         .font(.title2.weight(.bold))
-                    Text("Automatic discovery is read-only. Every deletion — including archived originals — requires your explicit confirmation.")
+                    Text("Target any folder with cleanup rules or review automatic proposals. Every deletion requires your confirmation.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        showRuleBuilder.toggle()
+                    }
+                } label: {
+                    Label(showRuleBuilder ? "Hide Folder Rule" : "Folder Rule Cleanup", systemImage: "wand.and.stars")
+                }
+                .buttonStyle(.bordered)
 
                 Button {
                     showSettingsPopover.toggle()
@@ -49,16 +77,30 @@ struct CleanupView: View {
 
             Divider()
 
+            // Rule-Based Folder Cleanup Panel (DEC-011)
+            if showRuleBuilder {
+                folderRuleCleanupPanel
+                Divider()
+            }
+
             // Category filter pills
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    categoryChip(title: "All Categories", count: appState.cleanupCandidateCount, isSelected: selectedCategory == nil) {
-                        selectedCategory = nil
+                    categoryChip(
+                        title: "All Categories",
+                        count: appState.cleanupCandidateCount,
+                        isSelected: appState.cleanupActiveCategoryFilter == nil
+                    ) {
+                        appState.cleanupActiveCategoryFilter = nil
                     }
                     ForEach(CleanupCategory.allCases) { cat in
                         let count = appState.cleanupProposal?.candidates(in: cat).count ?? 0
-                        categoryChip(title: cat.displayName, count: count, isSelected: selectedCategory == cat) {
-                            selectedCategory = cat
+                        categoryChip(
+                            title: cat.displayName,
+                            count: count,
+                            isSelected: appState.cleanupActiveCategoryFilter == cat
+                        ) {
+                            appState.cleanupActiveCategoryFilter = cat
                         }
                     }
                 }
@@ -102,10 +144,12 @@ struct CleanupView: View {
             }
 
             // Main proposals list
-            if appState.isScanningCleanup && appState.cleanupProposal == nil {
+            if (appState.isScanningCleanup && appState.cleanupProposal == nil) || appState.isEvaluatingCleanupRule {
                 VStack(spacing: 12) {
                     ProgressView()
-                    Text("Inspecting archived originals, large user files, caches, Docker artifacts, and node_modules…")
+                    Text(appState.isEvaluatingCleanupRule
+                        ? "Scanning folder for files matching your cleanup rule…"
+                        : "Inspecting archived originals, large user files, caches, Docker artifacts, and node_modules…")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -150,7 +194,7 @@ struct CleanupView: View {
                         .foregroundStyle(.green)
                     Text("No cleanup candidates found.")
                         .font(.headline)
-                    Text("Archived originals, large files, caches, Docker artifacts, and node_modules will appear here when detected.")
+                    Text("Use Folder Rule Cleanup above to target specific file types inside any folder, or refresh automatic proposals.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -194,11 +238,224 @@ struct CleanupView: View {
             .padding(14)
             .background(.bar)
         }
+        .onAppear {
+            syncExtensionsTextFromRule()
+        }
+        .onChange(of: appState.activeCleanupRule.id) { _, _ in
+            syncExtensionsTextFromRule()
+        }
         .sheet(isPresented: $appState.showingCleanupConfirmation) {
             CleanupConfirmationSheet()
                 .environmentObject(appState)
         }
     }
+
+    // MARK: - Rule-Based Folder Cleanup Panel (DEC-011)
+
+    private var folderRuleCleanupPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Folder Rule Cleanup", systemImage: "wand.and.stars")
+                    .font(.headline)
+                Text("Pick a folder and match files recursively (e.g. code files, ZIP archives, videos, or custom extensions).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+
+            // Row 1: Target Folder + Subfolders toggle + Quick Presets
+            HStack(spacing: 8) {
+                Text("Folder:")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextField("Target folder path", text: $appState.activeCleanupRule.folderPath)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospaced())
+                Button("Choose Folder…") {
+                    if let picked = appState.chooseFolder(title: "Choose Folder to Clean by Rule", initialPath: appState.activeCleanupRule.folderPath) {
+                        appState.activeCleanupRule.folderPath = picked
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Toggle("Include subfolders", isOn: $appState.activeCleanupRule.includeSubdirectories)
+                    .font(.caption)
+            }
+
+            // Row 2: Quick one-click presets
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    Text("Quick Rule:")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    quickPresetButton("All ZIPs (.zip)", categories: [], exts: ["zip"])
+                    quickPresetButton("All Archives", categories: [.archives], exts: [])
+                    quickPresetButton("All Videos", categories: [.videos], exts: [])
+                    quickPresetButton("All Code Files", categories: [.code], exts: [])
+                    quickPresetButton("All Installers (.dmg/.pkg)", categories: [.installers], exts: ["dmg", "pkg"])
+                    quickPresetButton("All Logs (.log)", categories: [], exts: ["log", "tmp"])
+                }
+            }
+
+            // Row 3: File Categories multi-toggle
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    Text("File Types:")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    ForEach(FileCategory.allCases) { cat in
+                        let active = appState.activeCleanupRule.fileCategories.contains(cat)
+                        Button {
+                            if active {
+                                appState.activeCleanupRule.fileCategories.removeAll { $0 == cat }
+                            } else {
+                                appState.activeCleanupRule.fileCategories.append(cat)
+                            }
+                        } label: {
+                            Text(cat.displayName)
+                                .font(.caption)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(active ? Color.accentColor.opacity(0.24) : Color.primary.opacity(0.06))
+                                .overlay(Capsule().stroke(active ? Color.accentColor : Color.clear, lineWidth: 1))
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // Row 4: Extensions, Filename pattern, Age, Min Size, Actions
+            HStack(spacing: 8) {
+                TextField("Extensions (e.g. zip, mp4, py)", text: $extensionsInput)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 175)
+                    .onChange(of: extensionsInput) { _, val in
+                        appState.activeCleanupRule.customExtensions = val
+                            .split(separator: ",")
+                            .map {
+                                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                                    .lowercased()
+                            }
+                            .filter { !$0.isEmpty }
+                    }
+
+                Picker("Name", selection: $appState.activeCleanupRule.fileNameMatchMode) {
+                    ForEach(FileNameMatchMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 135)
+
+                if appState.activeCleanupRule.fileNameMatchMode != .any {
+                    TextField("Pattern (e.g. *.zip)", text: $appState.activeCleanupRule.fileNamePattern)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 130)
+                }
+
+                Picker("Age", selection: $appState.activeCleanupRule.olderThanDays) {
+                    ForEach(ageOptions, id: \.label) { opt in
+                        Text(opt.label).tag(opt.days)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 135)
+
+                Picker("Size", selection: $appState.activeCleanupRule.minimumSizeBytes) {
+                    ForEach(minSizeOptions, id: \.bytes) { opt in
+                        Text(opt.label).tag(opt.bytes)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 105)
+
+                Spacer()
+
+                Button {
+                    var toSave = appState.activeCleanupRule
+                    toSave.id = UUID()
+                    let folderName = URL(fileURLWithPath: toSave.folderPath).lastPathComponent
+                    toSave.name = "\(toSave.summaryDescription) in \(folderName)"
+                    appState.saveCleanupRule(toSave)
+                } label: {
+                    Label("Save Rule", systemImage: "bookmark")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!appState.activeCleanupRule.hasCriteria || appState.activeCleanupRule.folderPath.isEmpty)
+
+                Button {
+                    let rule = appState.activeCleanupRule
+                    Task { await appState.runCleanupRule(rule) }
+                } label: {
+                    Label("Find Matching Files", systemImage: "magnifyingglass")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!appState.activeCleanupRule.hasCriteria || appState.activeCleanupRule.folderPath.isEmpty || appState.isEvaluatingCleanupRule)
+            }
+
+            // Saved rules strip
+            if !appState.configuration.cleanupRules.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        Text("Saved Rules:")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        ForEach(appState.configuration.cleanupRules) { saved in
+                            HStack(spacing: 4) {
+                                Button {
+                                    appState.activeCleanupRule = saved
+                                    syncExtensionsTextFromRule()
+                                    Task { await appState.runCleanupRule(saved) }
+                                } label: {
+                                    Text(saved.name)
+                                        .font(.caption)
+                                }
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    appState.deleteCleanupRule(id: saved.id)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.blue.opacity(0.10))
+                            .clipShape(Capsule())
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
+    }
+
+    private func quickPresetButton(_ title: String, categories: [FileCategory], exts: [String]) -> some View {
+        Button(title) {
+            appState.activeCleanupRule.name = title
+            appState.activeCleanupRule.fileCategories = categories
+            appState.activeCleanupRule.customExtensions = exts
+            appState.activeCleanupRule.fileNameMatchMode = .any
+            appState.activeCleanupRule.fileNamePattern = ""
+            extensionsInput = exts.joined(separator: ", ")
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.mini)
+    }
+
+    private func syncExtensionsTextFromRule() {
+        extensionsInput = appState.activeCleanupRule.customExtensions.joined(separator: ", ")
+    }
+
+    // MARK: - Candidate Row & Helpers
 
     private func candidateRow(_ candidate: CleanupCandidate) -> some View {
         let isSelected = appState.selectedCleanupIDs.contains(candidate.id)

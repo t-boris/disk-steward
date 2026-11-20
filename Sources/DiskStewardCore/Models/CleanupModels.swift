@@ -1,7 +1,8 @@
 import Foundation
 
-/// Categories of cleanup candidates discovered automatically for user review (REQ-006).
+/// Categories of cleanup candidates discovered automatically or via user cleanup rules (REQ-006, DEC-011).
 public enum CleanupCategory: String, CaseIterable, Codable, Sendable, Identifiable {
+    case ruleMatches
     case archivedOriginals
     case userFiles
     case caches
@@ -12,6 +13,7 @@ public enum CleanupCategory: String, CaseIterable, Codable, Sendable, Identifiab
 
     public var displayName: String {
         switch self {
+        case .ruleMatches: return "Folder Cleanup Rule Matches"
         case .archivedOriginals: return "Archived Originals (Verified)"
         case .userFiles: return "Large & Old User Files"
         case .caches: return "Caches"
@@ -22,12 +24,91 @@ public enum CleanupCategory: String, CaseIterable, Codable, Sendable, Identifiab
 
     public var systemImage: String {
         switch self {
+        case .ruleMatches: return "wand.and.stars"
         case .archivedOriginals: return "checkmark.shield"
         case .userFiles: return "doc.badge.clock"
         case .caches: return "tray.full"
         case .dockerArtifacts: return "shippingbox.circle"
         case .nodeModules: return "folder.badge.gearshape"
         }
+    }
+}
+
+/// A user-defined rule targeting a specific folder to recursively find and propose matching files for cleanup (DEC-011).
+public struct CleanupRule: Identifiable, Hashable, Codable, Sendable {
+    public var id: UUID
+    public var name: String
+    public var folderPath: String
+    public var includeSubdirectories: Bool
+    public var skipHiddenFiles: Bool
+    /// File categories to match (OR'd with customExtensions when either is non-empty).
+    public var fileCategories: [FileCategory]
+    /// Specific extensions without leading dot (e.g. ["zip", "mp4", "log"]).
+    public var customExtensions: [String]
+    public var fileNameMatchMode: FileNameMatchMode
+    public var fileNamePattern: String
+    /// Optional minimum age in days (nil = any age).
+    public var olderThanDays: Int?
+    /// Optional minimum allocated file size in bytes (0 = any size).
+    public var minimumSizeBytes: Int64
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        folderPath: String,
+        includeSubdirectories: Bool = true,
+        skipHiddenFiles: Bool = true,
+        fileCategories: [FileCategory] = [],
+        customExtensions: [String] = [],
+        fileNameMatchMode: FileNameMatchMode = .any,
+        fileNamePattern: String = "",
+        olderThanDays: Int? = nil,
+        minimumSizeBytes: Int64 = 0
+    ) {
+        self.id = id
+        self.name = name
+        self.folderPath = folderPath
+        self.includeSubdirectories = includeSubdirectories
+        self.skipHiddenFiles = skipHiddenFiles
+        self.fileCategories = fileCategories
+        self.customExtensions = customExtensions.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                .lowercased()
+        }.filter { !$0.isEmpty }
+        self.fileNameMatchMode = fileNameMatchMode
+        self.fileNamePattern = fileNamePattern
+        self.olderThanDays = olderThanDays.flatMap { $0 > 0 ? $0 : nil }
+        self.minimumSizeBytes = max(0, minimumSizeBytes)
+    }
+
+    /// True if the rule defines at least one narrowing criterion (preventing accidental "delete everything in folder" rules).
+    public var hasCriteria: Bool {
+        !fileCategories.isEmpty
+            || !customExtensions.isEmpty
+            || (fileNameMatchMode != .any && !fileNamePattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            || olderThanDays != nil
+            || minimumSizeBytes > 0
+    }
+
+    public var summaryDescription: String {
+        var parts: [String] = []
+        if !fileCategories.isEmpty {
+            parts.append(fileCategories.map(\.displayName).joined(separator: ", "))
+        }
+        if !customExtensions.isEmpty {
+            parts.append(customExtensions.map { ".\($0)" }.joined(separator: ", "))
+        }
+        if fileNameMatchMode != .any && !fileNamePattern.isEmpty {
+            parts.append("\(fileNameMatchMode.displayName) '\(fileNamePattern)'")
+        }
+        if let days = olderThanDays {
+            parts.append("Older than \(days)d")
+        }
+        if minimumSizeBytes > 0 {
+            parts.append(">= \(ByteFormatting.string(from: minimumSizeBytes))")
+        }
+        return parts.isEmpty ? "No filter criteria" : parts.joined(separator: " • ")
     }
 }
 

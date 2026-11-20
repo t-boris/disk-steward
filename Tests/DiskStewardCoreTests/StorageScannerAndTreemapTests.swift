@@ -141,4 +141,47 @@ final class StorageScannerAndTreemapTests: XCTestCase {
         XCTAssertFalse(StorageScanner.shouldSkipVirtualPath("/Volumes", rootPath: "/Volumes/Storage0"))
         XCTAssertFalse(StorageScanner.shouldSkipVirtualPath("/Users", rootPath: "/"))
     }
+
+    func testNestedStructuralTreemapNestsChildrenInsideParentsWithContrastingAdjacentColors() {
+        let now = Date()
+        let f1 = StorageNode(name: "clip1.mp4", path: "/root/Videos/clip1.mp4", isDirectory: false, allocatedSize: 500, modifiedDate: now, category: .videos)
+        let f2 = StorageNode(name: "clip2.mp4", path: "/root/Videos/clip2.mp4", isDirectory: false, allocatedSize: 300, modifiedDate: now, category: .videos)
+        let videos = StorageNode(name: "Videos", path: "/root/Videos", isDirectory: true, allocatedSize: 800, fileCount: 2, modifiedDate: now, category: .other, children: [f1, f2])
+
+        let c1 = StorageNode(name: "app.swift", path: "/root/Code/app.swift", isDirectory: false, allocatedSize: 250, modifiedDate: now, category: .code)
+        let c2 = StorageNode(name: "bundle.zip", path: "/root/Code/bundle.zip", isDirectory: false, allocatedSize: 150, modifiedDate: now, category: .archives)
+        let code = StorageNode(name: "Code", path: "/root/Code", isDirectory: true, allocatedSize: 400, fileCount: 2, modifiedDate: now, category: .other, children: [c1, c2])
+
+        let root = StorageNode(name: "root", path: "/root", isDirectory: true, allocatedSize: 1200, fileCount: 4, modifiedDate: now, category: .other, children: [videos, code])
+
+        let bounds = TreemapRect(x: 0, y: 0, width: 800, height: 600)
+        let nested = TreemapLayout.computeNested(scope: root, in: bounds, maxDepth: 3)
+
+        let depth0 = nested.filter { $0.depth == 0 }
+        let depth1 = nested.filter { $0.depth == 1 }
+        XCTAssertEqual(depth0.count, 2)
+        XCTAssertEqual(depth1.count, 4, "Both top-level folders must recursively render their nested child files")
+
+        // Adjacent top-level siblings must have contrasting colors (DEC-010).
+        XCTAssertNotEqual(depth0[0].colorIndex, depth0[1].colorIndex)
+
+        // Nested children must sit strictly inside their parent folder's rectangle and contrast with parent color.
+        let videosTile = depth0.first { $0.node.name == "Videos" }!
+        let videoChildren = depth1.filter { $0.node.path.hasPrefix("/root/Videos/") }
+        XCTAssertEqual(videoChildren.count, 2)
+        for child in videoChildren {
+            XCTAssertNotEqual(child.colorIndex, videosTile.colorIndex)
+            XCTAssertGreaterThanOrEqual(child.rect.x, videosTile.rect.x - 0.01)
+            XCTAssertGreaterThanOrEqual(child.rect.y, videosTile.rect.y - 0.01)
+            XCTAssertLessThanOrEqual(child.rect.maxX, videosTile.rect.maxX + 0.01)
+            XCTAssertLessThanOrEqual(child.rect.maxY, videosTile.rect.maxY + 0.01)
+        }
+        XCTAssertNotEqual(videoChildren[0].colorIndex, videoChildren[1].colorIndex)
+
+        // Custom extension filter narrows scope cleanly.
+        let zipFilter = StorageFilter(customExtensions: ["zip"])
+        let filtered = StorageAnalyzer.filteredTree(root, filter: zipFilter, relativeTo: now)
+        XCTAssertEqual(filtered?.fileCount, 1)
+        XCTAssertEqual(filtered?.allocatedSize, 150)
+    }
 }

@@ -50,14 +50,13 @@ final class AppState: ObservableObject {
     @Published var volumes: [DiskVolume] = []
     @Published var lastVolumeRefresh: Date?
 
-    // MARK: - Storage Explorer (REQ-003, REQ-004)
+    // MARK: - Storage Explorer (REQ-003, REQ-004, DEC-010)
     @Published var selectedScanPath: String
     @Published var isScanning: Bool = false
     @Published var scanProgress: ScanProgress?
     @Published var scanResult: ScanResult?
     @Published var currentZoomPath: String?
     @Published var storageFilter: StorageFilter = StorageFilter()
-    @Published var treemapColorMode: TreemapColorMode = .byDateAge
     @Published var selectedNodeID: String?
     @Published var hoveredNode: StorageNode?
 
@@ -68,13 +67,16 @@ final class AppState: ObservableObject {
     @Published var previewPlan: ArchivePlan?
     @Published var isBuildingPlan: Bool = false
 
-    // MARK: - Cleanup (REQ-006)
+    // MARK: - Cleanup (REQ-006, DEC-011)
     @Published var isScanningCleanup: Bool = false
     @Published var cleanupProposal: CleanupProposal?
     @Published var selectedCleanupIDs: Set<String> = []
     @Published var showingCleanupConfirmation: Bool = false
     @Published var isExecutingCleanup: Bool = false
     @Published var lastCleanupResult: CleanupExecutionResult?
+    @Published var activeCleanupRule: CleanupRule
+    @Published var isEvaluatingCleanupRule: Bool = false
+    @Published var cleanupActiveCategoryFilter: CleanupCategory? = nil
 
     // MARK: - Status Feedback
     @Published var statusBanner: String?
@@ -90,6 +92,7 @@ final class AppState: ObservableObject {
     private let cleanupExecutor: CleanupExecutor
 
     private var scanTask: Task<Void, Never>?
+    private var archiveTask: Task<ArchiveExecutionOutput, Never>?
     private nonisolated(unsafe) var volumeTimer: Timer?
     private nonisolated(unsafe) var scheduleTimer: Timer?
     private nonisolated(unsafe) var workspaceObservers: [NSObjectProtocol] = []
@@ -106,7 +109,16 @@ final class AppState: ObservableObject {
         self.selectedArchiveJobID = loaded.configuration.archiveJobs.first?.id
 
         let homeDownloads = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads")
-        self.selectedScanPath = FileManager.default.fileExists(atPath: homeDownloads) ? homeDownloads : NSHomeDirectory()
+        let defaultFolder = FileManager.default.fileExists(atPath: homeDownloads) ? homeDownloads : NSHomeDirectory()
+        self.selectedScanPath = defaultFolder
+        self.activeCleanupRule = CleanupRule(
+            name: "Folder Cleanup Rule",
+            folderPath: defaultFolder,
+            includeSubdirectories: true,
+            skipHiddenFiles: true,
+            fileCategories: [.archives],
+            customExtensions: ["zip"]
+        )
 
         let tracked = loaded.configuration.trackedVolumePaths
             + loaded.configuration.archiveJobs.flatMap(\.configuredDestinations)
@@ -351,6 +363,94 @@ final class AppState: ObservableObject {
         storageFilter = StorageFilter()
     }
 
+    // MARK: - Rule-Based Folder Cleanup (DEC-011)
+
+    func openFolderCleanupFromExplorer(folderPath: String) {
+        let folderName = URL(fileURLWithPath: folderPath).lastPathComponent
+        var categories = Array(storageFilter.includedCategories)
+        let extensions = storageFilter.customExtensions
+        if categories.isEmpty && extensions.isEmpty {
+            categories = [.archives]
+        }
+
+        let olderDays: Int?
+        switch storageFilter.datePreset {
+        case .olderThan30Days: olderDays = 30
+        case .olderThan6Months: olderDays = 180
+        case .olderThan1Year: olderDays = 365
+        default: olderDays = nil
+        }
+
+        activeCleanupRule = CleanupRule(
+            name: "Clean \(folderName)",
+            folderPath: folderPath,
+            includeSubdirectories: true,
+            skipHiddenFiles: true,
+            fileCategories: categories,
+            customExtensions: extensions,
+            fileNameMatchMode: storageFilter.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .any : .contains,
+            fileNamePattern: storageFilter.searchText.trimmingCharacters(in: .whitespacesAndNewlines),
+            olderThanDays: olderDays,
+            minimumSizeBytes: storageFilter.minimumSizeBytes
+        )
+        cleanupActiveCategoryFilter = .ruleMatches
+        selectedSection = .cleanup
+
+        Task { [weak self] in
+            guard let self else { return }
+            await self.runCleanupRule(self.activeCleanupRule)
+        }
+    }
+
+    func runCleanupRule(_ rule: CleanupRule) async {
+        isEvaluatingCleanupRule = true
+        let engine = CleanupRuleEngine()
+        let (matched, ruleNotes): ([CleanupCandidate], [String]) = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let res = autoreleasepool { engine.evaluate(rule: rule) }
+                continuation.resume(returning: res)
+            }
+        }
+
+        isEvaluatingCleanupRule = false
+
+        let existingNonRule = (cleanupProposal?.candidates ?? []).filter { $0.category != .ruleMatches }
+        let existingNotes = cleanupProposal?.notes ?? []
+        let mergedProposal = CleanupProposal(
+            createdAt: Date(),
+            candidates: matched + existingNonRule,
+            notes: ruleNotes + existingNotes,
+            dockerStatusMessage: cleanupProposal?.dockerStatusMessage
+        )
+        cleanupProposal = mergedProposal
+        cleanupActiveCategoryFilter = .ruleMatches
+
+        // Pre-select all newly matched files so the user can review and confirm deletion immediately (DEC-003).
+        selectedCleanupIDs = Set(matched.map(\.id))
+
+        if matched.isEmpty {
+            statusBanner = ruleNotes.first ?? "No files matched rule '\(rule.name)' in \(rule.folderPath)."
+        } else {
+            let totalBytes = matched.reduce(Int64(0)) { $0 + $1.estimatedReclaimableBytes }
+            statusBanner = "Rule '\(rule.name)' matched \(matched.count) file(s) (\(ByteFormatting.string(from: totalBytes))). Review and confirm deletion when ready."
+        }
+    }
+
+    func saveCleanupRule(_ rule: CleanupRule) {
+        if let idx = configuration.cleanupRules.firstIndex(where: { $0.id == rule.id }) {
+            configuration.cleanupRules[idx] = rule
+        } else {
+            configuration.cleanupRules.append(rule)
+        }
+        persistState()
+        statusBanner = "Saved cleanup rule '\(rule.name)'."
+    }
+
+    func deleteCleanupRule(id: UUID) {
+        configuration.cleanupRules.removeAll { $0.id == id }
+        persistState()
+    }
+
     // MARK: - Classified Archiving & Scheduling (REQ-005)
 
     func addArchiveJob(_ job: ArchiveJob) {
@@ -384,9 +484,9 @@ final class AppState: ObservableObject {
         isBuildingPlan = true
         let engine = archiveRuleEngine
         let mounted = mountedVolumePathSet
-        Task.detached(priority: .userInitiated) { [weak self] in
-            let plan = engine.buildPlan(for: job, mountedVolumePaths: mounted)
-            await MainActor.run { [weak self] in
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let plan = autoreleasepool { engine.buildPlan(for: job, mountedVolumePaths: mounted) }
+            DispatchQueue.main.async {
                 self?.previewPlan = plan
                 self?.isBuildingPlan = false
             }
@@ -412,14 +512,44 @@ final class AppState: ObservableObject {
             }
         }
 
-        let output = await Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) {
             await executor.execute(job: job, trigger: trigger, mountedVolumePaths: mounted, progressHandler: onArchiveProgress)
-        }.value
+        }
+        archiveTask = task
+        let output = await task.value
+        archiveTask = nil
 
         isArchiving = false
         activeArchiveProgress = nil
 
-        archiveRunHistory.insert(output.report, at: 0)
+        // Keep persisted history compact while preserving all failure/warning/renamed outcomes.
+        let importantOutcomes = output.report.outcomes.filter {
+            $0.kind == .failed || $0.kind == .skippedSourceChanged || $0.kind == .copiedRenamed || $0.kind == .interrupted
+        }
+        let regularOutcomes = output.report.outcomes.filter {
+            $0.kind == .copied || $0.kind == .skippedDuplicate || $0.kind == .skippedUnmatched || $0.kind == .destinationUnavailable
+        }
+        let cappedOutcomes = Array((importantOutcomes + regularOutcomes).prefix(500))
+        let compactReport = ArchiveRunReport(
+            id: output.report.id,
+            jobID: output.report.jobID,
+            jobName: output.report.jobName,
+            trigger: output.report.trigger,
+            startedAt: output.report.startedAt,
+            finishedAt: output.report.finishedAt,
+            status: output.report.status,
+            copiedCount: output.report.copiedCount,
+            renamedCount: output.report.renamedCount,
+            duplicateCount: output.report.duplicateCount,
+            unmatchedCount: output.report.unmatchedCount,
+            sourceChangedCount: output.report.sourceChangedCount,
+            failedCount: output.report.failedCount,
+            interruptedCount: output.report.interruptedCount,
+            bytesCopied: output.report.bytesCopied,
+            unavailableDestinations: output.report.unavailableDestinations,
+            outcomes: cappedOutcomes
+        )
+        archiveRunHistory.insert(compactReport, at: 0)
 
         if output.report.status == .deferredDestinationUnavailable {
             // Keep pending until destination volume reconnects (DEC-004).
@@ -462,6 +592,11 @@ final class AppState: ObservableObject {
         }
 
         persistState()
+    }
+
+    func cancelActiveArchive() {
+        archiveTask?.cancel()
+        statusBanner = "Cancelling active archive run…"
     }
 
     func evaluateArchiveSchedules() async {

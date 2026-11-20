@@ -39,25 +39,73 @@ public struct ArchiveExecutor: Sendable {
         self.maxRetriesOnSourceChange = max(0, maxRetriesOnSourceChange)
     }
 
+    private final class AtomicCancelFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+        var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    }
+
     /// Executes `job` without EVER deleting any source original.
-    /// If any required destination volume is unavailable, returns a deferred report instead of failing destructively.
+    /// Runs on a dedicated utility DispatchQueue (never blocking MainActor or starving Swift's cooperative pool),
+    /// in bounded constant memory (autoreleasepool + streaming POSIX SHA-256 + hash caching),
+    /// and defers cleanly if any required destination volume is unavailable.
     public func execute(
         job: ArchiveJob,
         trigger: ArchiveTrigger,
         mountedVolumePaths: Set<String>? = nil,
         progressHandler: (@Sendable (ArchiveProgress) -> Void)? = nil
     ) async -> ArchiveExecutionOutput {
+        let cancelFlag = AtomicCancelFlag()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    let output = autoreleasepool {
+                        self.executeSync(
+                            job: job,
+                            trigger: trigger,
+                            mountedVolumePaths: mountedVolumePaths,
+                            cancelFlag: cancelFlag,
+                            progressHandler: progressHandler
+                        )
+                    }
+                    continuation.resume(returning: output)
+                }
+            }
+        } onCancel: {
+            cancelFlag.cancel()
+        }
+    }
+
+    private func executeSync(
+        job: ArchiveJob,
+        trigger: ArchiveTrigger,
+        mountedVolumePaths: Set<String>?,
+        cancelFlag: AtomicCancelFlag,
+        progressHandler: (@Sendable (ArchiveProgress) -> Void)?
+    ) -> ArchiveExecutionOutput {
         let startedAt = Date()
-        let plan = ruleEngine.buildPlan(for: job, mountedVolumePaths: mountedVolumePaths)
+        progressHandler?(
+            ArchiveProgress(
+                jobID: job.id,
+                currentFileName: "Scanning source folders…",
+                completedItems: 0,
+                totalItems: 0,
+                bytesCopied: 0
+            )
+        )
+
+        // Route files without redundant pre-hashing so each file is hashed only once during execution.
+        let routed = ruleEngine.routeFiles(for: job, mountedVolumePaths: mountedVolumePaths)
 
         // If any destination disk needed by this job is currently disconnected, defer cleanly (DEC-004).
-        if !plan.unavailableDestinations.isEmpty {
-            let unavailableOutcomes = plan.entries
-                .filter { $0.action == .destinationUnavailable }
+        if !routed.unavailableDestinations.isEmpty {
+            let unavailableOutcomes = routed.items
+                .filter(\.isDestinationUnavailable)
                 .map {
                     ArchiveItemOutcome(
                         sourcePath: $0.sourcePath,
-                        destinationPath: $0.destinationPath,
+                        destinationPath: $0.desiredDestinationPath,
                         kind: .destinationUnavailable,
                         detail: "Destination volume is unavailable"
                     )
@@ -70,7 +118,7 @@ public struct ArchiveExecutor: Sendable {
                 startedAt: startedAt,
                 finishedAt: Date(),
                 status: .deferredDestinationUnavailable,
-                unavailableDestinations: plan.unavailableDestinations,
+                unavailableDestinations: routed.unavailableDestinations,
                 outcomes: unavailableOutcomes
             )
             return ArchiveExecutionOutput(report: report, verifiedRecords: [])
@@ -79,6 +127,7 @@ public struct ArchiveExecutor: Sendable {
         var outcomes: [ArchiveItemOutcome] = []
         var verifiedRecords: [VerifiedArchiveRecord] = []
         var claimedDestinations: [String: String] = [:]
+        var existingHashCache: [String: String] = [:]
 
         var copiedCount = 0
         var renamedCount = 0
@@ -90,15 +139,16 @@ public struct ArchiveExecutor: Sendable {
         var totalBytesCopied: Int64 = 0
 
         let fm = FileManager.default
-        let totalEntries = plan.entries.count
+        let totalEntries = routed.items.count
+        var lastProgressEmit: CFAbsoluteTime = 0
 
-        for (index, entry) in plan.entries.enumerated() {
-            if Task.isCancelled {
+        for (index, item) in routed.items.enumerated() {
+            if cancelFlag.isCancelled {
                 interruptedCount += 1
                 outcomes.append(
                     ArchiveItemOutcome(
-                        sourcePath: entry.sourcePath,
-                        destinationPath: entry.destinationPath,
+                        sourcePath: item.sourcePath,
+                        destinationPath: item.desiredDestinationPath,
                         kind: .interrupted,
                         detail: "Archive run was cancelled before copying this file"
                     )
@@ -106,24 +156,24 @@ public struct ArchiveExecutor: Sendable {
                 continue
             }
 
-            if entry.action == .skipUnmatched {
+            if item.isUnmatched {
                 unmatchedCount += 1
                 outcomes.append(
                     ArchiveItemOutcome(
-                        sourcePath: entry.sourcePath,
+                        sourcePath: item.sourcePath,
                         destinationPath: nil,
                         kind: .skippedUnmatched,
-                        detail: entry.note
+                        detail: "No classification rule matched and no fallback folder is configured"
                     )
                 )
                 continue
             }
 
-            guard let plannedDestPath = entry.destinationPath else {
+            guard let desiredDestPath = item.desiredDestinationPath else {
                 failedCount += 1
                 outcomes.append(
                     ArchiveItemOutcome(
-                        sourcePath: entry.sourcePath,
+                        sourcePath: item.sourcePath,
                         destinationPath: nil,
                         kind: .failed,
                         detail: "Missing destination path"
@@ -132,31 +182,34 @@ public struct ArchiveExecutor: Sendable {
                 continue
             }
 
-            progressHandler?(
-                ArchiveProgress(
+            if let progressHandler {
+                let now = CFAbsoluteTimeGetCurrent()
+                if index == 0 || now - lastProgressEmit >= 0.25 {
+                    lastProgressEmit = now
+                    progressHandler(
+                        ArchiveProgress(
+                            jobID: job.id,
+                            currentFileName: item.fileName,
+                            completedItems: index,
+                            totalItems: totalEntries,
+                            bytesCopied: totalBytesCopied
+                        )
+                    )
+                }
+            }
+
+            let copyOutcome: SingleFileResult = autoreleasepool {
+                let sourceURL = URL(fileURLWithPath: item.sourcePath)
+                let baseDesiredDestURL = URL(fileURLWithPath: desiredDestPath)
+                return copySingleFileWithVerification(
                     jobID: job.id,
-                    currentFileName: entry.fileName,
-                    completedItems: index,
-                    totalItems: totalEntries,
-                    bytesCopied: totalBytesCopied
+                    sourceURL: sourceURL,
+                    desiredDestURL: baseDesiredDestURL,
+                    claimedDestinations: &claimedDestinations,
+                    existingHashCache: &existingHashCache,
+                    fileManager: fm
                 )
-            )
-
-            let sourceURL = URL(fileURLWithPath: entry.sourcePath)
-            let plannedURL = URL(fileURLWithPath: plannedDestPath)
-            // Always resolve live collisions starting from the base filename inside the target directory,
-            // so duplicate detection and rename reporting (.copiedRenamed) remain accurate at copy time.
-            let baseDesiredDestURL = plannedURL
-                .deletingLastPathComponent()
-                .appendingPathComponent(entry.fileName)
-
-            let copyOutcome = copySingleFileWithVerification(
-                jobID: job.id,
-                sourceURL: sourceURL,
-                desiredDestURL: baseDesiredDestURL,
-                claimedDestinations: &claimedDestinations,
-                fileManager: fm
-            )
+            }
 
             outcomes.append(copyOutcome.outcome)
             if let record = copyOutcome.verifiedRecord {
@@ -186,9 +239,9 @@ public struct ArchiveExecutor: Sendable {
         }
 
         let status: ArchiveRunStatus
-        if interruptedCount > 0 || Task.isCancelled {
+        if interruptedCount > 0 || cancelFlag.isCancelled {
             status = .cancelled
-        } else if failedCount > 0 || sourceChangedCount > 0 || !plan.scanErrors.isEmpty {
+        } else if failedCount > 0 || sourceChangedCount > 0 || !routed.scanErrors.isEmpty {
             status = .completedWithErrors
         } else {
             status = .completed
@@ -226,6 +279,7 @@ public struct ArchiveExecutor: Sendable {
         sourceURL: URL,
         desiredDestURL: URL,
         claimedDestinations: inout [String: String],
+        existingHashCache: inout [String: String],
         fileManager fm: FileManager
     ) -> SingleFileResult {
         var attempt = 0
@@ -242,9 +296,11 @@ public struct ArchiveExecutor: Sendable {
                 // Re-resolve collision right at execution time with live SHA-256 (DEC-007).
                 let resolution = ruleEngine.resolveDestination(
                     sourceURL: sourceURL,
+                    sourceFileSize: sizeBefore,
                     desiredDestinationURL: desiredDestURL,
                     sourceSHA256: sourceHash,
-                    claimedDestinations: &claimedDestinations
+                    claimedDestinations: &claimedDestinations,
+                    existingHashCache: &existingHashCache
                 )
 
                 if resolution.action == .skipDuplicate {
@@ -309,6 +365,7 @@ public struct ArchiveExecutor: Sendable {
                 // Atomically commit verified temporary file to final destination path (never overwrites).
                 try fm.moveItem(at: tempURL, to: finalDestURL)
                 try? fm.setAttributes([.modificationDate: modBefore], ofItemAtPath: finalDestURL.path)
+                existingHashCache[finalDestURL.standardizedFileURL.path] = destHash
 
                 let record = VerifiedArchiveRecord(
                     jobID: jobID,

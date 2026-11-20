@@ -186,13 +186,20 @@ struct ArchivingView: View {
                     .buttonStyle(.bordered)
                     .disabled(appState.isBuildingPlan || appState.isArchiving)
 
-                    Button {
-                        Task { await appState.runArchiveJob(job, trigger: .onDemand) }
-                    } label: {
-                        Label(appState.isArchiving ? "Archiving…" : "Archive Now", systemImage: "play.fill")
+                    if appState.isArchiving {
+                        Button("Cancel Archive") {
+                            appState.cancelActiveArchive()
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
+                    } else {
+                        Button {
+                            Task { await appState.runArchiveJob(job, trigger: .onDemand) }
+                        } label: {
+                            Label("Archive Now", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(appState.isArchiving)
 
                     Button("Edit") {
                         editingJob = job

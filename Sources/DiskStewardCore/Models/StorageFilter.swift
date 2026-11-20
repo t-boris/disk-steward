@@ -40,10 +40,12 @@ public enum TreemapColorMode: String, CaseIterable, Codable, Sendable, Identifia
     }
 }
 
-/// Filter criteria for narrowing treemap exploration and storage breakdowns (REQ-004).
+/// Filter criteria for narrowing treemap exploration and storage breakdowns (REQ-004, DEC-010).
 public struct StorageFilter: Hashable, Codable, Sendable {
     /// Empty means include all file categories.
     public var includedCategories: Set<FileCategory>
+    /// Optional specific extensions (lowercase without leading dot, e.g. ["zip", "mp4"]).
+    public var customExtensions: [String]
     public var datePreset: DateFilterPreset
     /// Inclusive lower bound ("not older than") when datePreset == .custom.
     public var notOlderThan: Date?
@@ -54,6 +56,7 @@ public struct StorageFilter: Hashable, Codable, Sendable {
 
     public init(
         includedCategories: Set<FileCategory> = [],
+        customExtensions: [String] = [],
         datePreset: DateFilterPreset = .anyTime,
         notOlderThan: Date? = nil,
         notNewerThan: Date? = nil,
@@ -61,6 +64,11 @@ public struct StorageFilter: Hashable, Codable, Sendable {
         searchText: String = ""
     ) {
         self.includedCategories = includedCategories
+        self.customExtensions = customExtensions.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                .lowercased()
+        }.filter { !$0.isEmpty }
         self.datePreset = datePreset
         self.notOlderThan = notOlderThan
         self.notNewerThan = notNewerThan
@@ -70,6 +78,7 @@ public struct StorageFilter: Hashable, Codable, Sendable {
 
     public var isActive: Bool {
         !includedCategories.isEmpty
+            || !customExtensions.isEmpty
             || datePreset != .anyTime
             || minimumSizeBytes > 0
             || !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -78,8 +87,19 @@ public struct StorageFilter: Hashable, Codable, Sendable {
     public func matchesFile(_ node: StorageNode, relativeTo now: Date = Date()) -> Bool {
         guard !node.isDirectory else { return true }
 
-        if !includedCategories.isEmpty && !includedCategories.contains(node.category) {
-            return false
+        let hasCategoryFilter = !includedCategories.isEmpty
+        let hasExtFilter = !customExtensions.isEmpty
+        if hasCategoryFilter || hasExtFilter {
+            let ext = URL(fileURLWithPath: node.name).pathExtension.lowercased()
+            let catMatches = hasCategoryFilter && includedCategories.contains(node.category)
+            let extMatches = hasExtFilter && !ext.isEmpty && customExtensions.contains(ext)
+            if hasCategoryFilter && hasExtFilter {
+                if !catMatches && !extMatches { return false }
+            } else if hasCategoryFilter {
+                if !catMatches { return false }
+            } else {
+                if !extMatches { return false }
+            }
         }
 
         if minimumSizeBytes > 0 && node.allocatedSize < minimumSizeBytes {

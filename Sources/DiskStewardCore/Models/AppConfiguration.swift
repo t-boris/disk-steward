@@ -4,6 +4,7 @@ import Foundation
 public struct AppConfiguration: Codable, Hashable, Sendable {
     public var volumeRefreshIntervalSeconds: TimeInterval
     public var archiveJobs: [ArchiveJob]
+    public var cleanupRules: [CleanupRule]
     public var cleanupLargeFileThresholdBytes: Int64
     public var cleanupOldInstallerAgeDays: Int
     public var cleanupUserFileRoots: [String]
@@ -15,6 +16,7 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
     public init(
         volumeRefreshIntervalSeconds: TimeInterval = 30,
         archiveJobs: [ArchiveJob] = [],
+        cleanupRules: [CleanupRule] = [],
         cleanupLargeFileThresholdBytes: Int64 = 100 * 1_000_000, // 100 MB
         cleanupOldInstallerAgeDays: Int = 14,
         cleanupUserFileRoots: [String]? = nil,
@@ -25,6 +27,7 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
     ) {
         self.volumeRefreshIntervalSeconds = max(5, volumeRefreshIntervalSeconds)
         self.archiveJobs = archiveJobs
+        self.cleanupRules = cleanupRules
         self.cleanupLargeFileThresholdBytes = max(1_000_000, cleanupLargeFileThresholdBytes)
         self.cleanupOldInstallerAgeDays = max(0, cleanupOldInstallerAgeDays)
         self.cleanupUserFileRoots = cleanupUserFileRoots ?? Self.defaultUserFileRoots()
@@ -32,6 +35,33 @@ public struct AppConfiguration: Codable, Hashable, Sendable {
         self.includeCacheCleanup = includeCacheCleanup
         self.includeDockerCleanup = includeDockerCleanup
         self.trackedVolumePaths = trackedVolumePaths
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case volumeRefreshIntervalSeconds
+        case archiveJobs
+        case cleanupRules
+        case cleanupLargeFileThresholdBytes
+        case cleanupOldInstallerAgeDays
+        case cleanupUserFileRoots
+        case nodeModulesSearchRoots
+        case includeCacheCleanup
+        case includeDockerCleanup
+        case trackedVolumePaths
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        volumeRefreshIntervalSeconds = max(5, try c.decodeIfPresent(TimeInterval.self, forKey: .volumeRefreshIntervalSeconds) ?? 30)
+        archiveJobs = try c.decodeIfPresent([ArchiveJob].self, forKey: .archiveJobs) ?? []
+        cleanupRules = try c.decodeIfPresent([CleanupRule].self, forKey: .cleanupRules) ?? []
+        cleanupLargeFileThresholdBytes = max(1_000_000, try c.decodeIfPresent(Int64.self, forKey: .cleanupLargeFileThresholdBytes) ?? 100 * 1_000_000)
+        cleanupOldInstallerAgeDays = max(0, try c.decodeIfPresent(Int.self, forKey: .cleanupOldInstallerAgeDays) ?? 14)
+        cleanupUserFileRoots = try c.decodeIfPresent([String].self, forKey: .cleanupUserFileRoots) ?? Self.defaultUserFileRoots()
+        nodeModulesSearchRoots = try c.decodeIfPresent([String].self, forKey: .nodeModulesSearchRoots) ?? Self.defaultNodeModulesRoots()
+        includeCacheCleanup = try c.decodeIfPresent(Bool.self, forKey: .includeCacheCleanup) ?? true
+        includeDockerCleanup = try c.decodeIfPresent(Bool.self, forKey: .includeDockerCleanup) ?? true
+        trackedVolumePaths = try c.decodeIfPresent([String].self, forKey: .trackedVolumePaths) ?? []
     }
 
     public static func defaultUserFileRoots(homeDirectory: String = NSHomeDirectory()) -> [String] {
