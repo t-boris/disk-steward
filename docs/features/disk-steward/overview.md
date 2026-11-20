@@ -2,7 +2,7 @@
 type: feature
 id: disk-steward
 title: Disk Steward
-status: implementing
+status: verified
 owner: Boris Tsekinovsky
 created: 2026-11-20
 provenance: Created from the new-project intake
