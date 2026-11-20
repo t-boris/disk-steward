@@ -1,2 +1,8 @@
 .dde/
 .DS_Store
+.build/
+.swiftpm/
+dist/
+*.xcuserdata
+*.xcworkspace/xcuserdata/
+Package.resolved
