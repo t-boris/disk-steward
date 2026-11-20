@@ -174,4 +174,104 @@ final class ArchiveRuleEngineAndExecutorTests: XCTestCase {
         XCTAssertTrue(output.verifiedRecords.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: srcFile.path))
     }
+
+    func testFallbackAndRulesPreserveFolderStructureByDefaultAndSupportFlatMode() async throws {
+        let fm = FileManager.default
+        let workDir = documentsDir.appendingPathComponent("Work/2026")
+        let personalDir = documentsDir.appendingPathComponent("Personal/Recipes")
+        try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: personalDir, withIntermediateDirectories: true)
+
+        let taxFile = workDir.appendingPathComponent("tax.pdf")
+        let recipeFile = personalDir.appendingPathComponent("soup.txt")
+        let topFile = documentsDir.appendingPathComponent("notes.md")
+        try Data("tax-2026".utf8).write(to: taxFile)
+        try Data("soup-recipe".utf8).write(to: recipeFile)
+        try Data("root-notes".utf8).write(to: topFile)
+
+        // 1. No rules + fallback destination -> preserves relative folder hierarchy by default (DEC-014).
+        let preservedDest = archiveRoot.appendingPathComponent("DocumentsPreserved")
+        let preservedJob = ArchiveJob(
+            name: "Documents Full Tree",
+            sourceFolders: [documentsDir.path],
+            rules: [],
+            fallbackDestinationPath: preservedDest.path
+        )
+        XCTAssertTrue(preservedJob.preserveFolderStructure)
+
+        let executor = ArchiveExecutor()
+        let preservedOut = await executor.execute(job: preservedJob, trigger: .onDemand, mountedVolumePaths: ["/"])
+        XCTAssertEqual(preservedOut.report.status, .completed)
+        XCTAssertEqual(preservedOut.report.copiedCount, 3)
+        XCTAssertTrue(fm.fileExists(atPath: preservedDest.appendingPathComponent("Work/2026/tax.pdf").path))
+        XCTAssertTrue(fm.fileExists(atPath: preservedDest.appendingPathComponent("Personal/Recipes/soup.txt").path))
+        XCTAssertTrue(fm.fileExists(atPath: preservedDest.appendingPathComponent("notes.md").path))
+
+        // Re-run recognizes existing nested copies as SHA-256 duplicates.
+        let rerunOut = await executor.execute(job: preservedJob, trigger: .onDemand, mountedVolumePaths: ["/"])
+        XCTAssertEqual(rerunOut.report.copiedCount, 0)
+        XCTAssertEqual(rerunOut.report.duplicateCount, 3)
+
+        // 2. Explicit flat mode (preserveFolderStructure = false) flattens files directly into target.
+        let flatDest = archiveRoot.appendingPathComponent("DocumentsFlat")
+        var flatJob = preservedJob
+        flatJob.fallbackDestinationPath = flatDest.path
+        flatJob.preserveFolderStructure = false
+        let flatOut = await executor.execute(job: flatJob, trigger: .onDemand, mountedVolumePaths: ["/"])
+        XCTAssertEqual(flatOut.report.copiedCount, 3)
+        XCTAssertTrue(fm.fileExists(atPath: flatDest.appendingPathComponent("tax.pdf").path))
+        XCTAssertTrue(fm.fileExists(atPath: flatDest.appendingPathComponent("soup.txt").path))
+        XCTAssertTrue(fm.fileExists(atPath: flatDest.appendingPathComponent("notes.md").path))
+        XCTAssertFalse(fm.fileExists(atPath: flatDest.appendingPathComponent("Work/2026/tax.pdf").path))
+
+        // 3. Per-rule preserveRelativeSubpath defaults to true and can be set to false per rule.
+        let rulePreservedDest = archiveRoot.appendingPathComponent("RulePreserved")
+        let ruleFlatDest = archiveRoot.appendingPathComponent("RuleFlat")
+        let ruleJob = ArchiveJob(
+            name: "Rule Subfolder Modes",
+            sourceFolders: [documentsDir.path],
+            rules: [
+                ArchiveRule(
+                    name: "PDFs Keep Tree",
+                    customExtensions: ["pdf"],
+                    destinationFolderPath: rulePreservedDest.path
+                ),
+                ArchiveRule(
+                    name: "TXT Flat",
+                    customExtensions: ["txt"],
+                    destinationFolderPath: ruleFlatDest.path,
+                    preserveRelativeSubpath: false
+                )
+            ]
+        )
+        let ruleOut = await executor.execute(job: ruleJob, trigger: .onDemand, mountedVolumePaths: ["/"])
+        XCTAssertEqual(ruleOut.report.copiedCount, 2)
+        XCTAssertTrue(fm.fileExists(atPath: rulePreservedDest.appendingPathComponent("Work/2026/tax.pdf").path))
+        XCTAssertTrue(fm.fileExists(atPath: ruleFlatDest.appendingPathComponent("soup.txt").path))
+        XCTAssertFalse(fm.fileExists(atPath: ruleFlatDest.appendingPathComponent("Personal/Recipes/soup.txt").path))
+
+        // 4. Backward compatibility: legacy JSON without `preserveFolderStructure` decodes to `true`.
+        let legacyJSON = """
+        {
+          "id": "11111111-1111-1111-1111-111111111111",
+          "name": "Legacy Documents Job",
+          "sourceFolders": ["\(documentsDir.path)"],
+          "rules": [],
+          "fallbackDestinationPath": "\(preservedDest.path)",
+          "includeSubdirectories": true,
+          "skipHiddenFiles": true,
+          "schedule": {
+            "isEnabled": false,
+            "frequency": "manual",
+            "hour": 2,
+            "minute": 0,
+            "weekday": 1,
+            "intervalMinutes": 60
+          },
+          "createdAt": 0
+        }
+        """
+        let decoded = try JSONDecoder().decode(ArchiveJob.self, from: Data(legacyJSON.utf8))
+        XCTAssertTrue(decoded.preserveFolderStructure)
+    }
 }

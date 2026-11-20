@@ -50,7 +50,7 @@ public struct ArchiveRule: Identifiable, Hashable, Codable, Sendable {
         fileNamePattern: String = "",
         sourceFolderPath: String? = nil,
         destinationFolderPath: String,
-        preserveRelativeSubpath: Bool = false
+        preserveRelativeSubpath: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -182,6 +182,8 @@ public struct ArchiveJob: Identifiable, Hashable, Codable, Sendable {
     /// Optional fallback folder for files matching no explicit rule (DEC-008). When nil, unmatched files remain untouched.
     public var fallbackDestinationPath: String?
     public var includeSubdirectories: Bool
+    /// When true (default), preserves relative subfolder hierarchy inside fallback destination and as the default for new rules (DEC-014).
+    public var preserveFolderStructure: Bool
     public var skipHiddenFiles: Bool
     public var schedule: ArchiveSchedule
     public var createdAt: Date
@@ -194,6 +196,7 @@ public struct ArchiveJob: Identifiable, Hashable, Codable, Sendable {
         rules: [ArchiveRule] = [],
         fallbackDestinationPath: String? = nil,
         includeSubdirectories: Bool = true,
+        preserveFolderStructure: Bool = true,
         skipHiddenFiles: Bool = true,
         schedule: ArchiveSchedule = ArchiveSchedule(),
         createdAt: Date = Date(),
@@ -205,10 +208,33 @@ public struct ArchiveJob: Identifiable, Hashable, Codable, Sendable {
         self.rules = rules
         self.fallbackDestinationPath = fallbackDestinationPath?.isEmpty == true ? nil : fallbackDestinationPath
         self.includeSubdirectories = includeSubdirectories
+        self.preserveFolderStructure = preserveFolderStructure
         self.skipHiddenFiles = skipHiddenFiles
         self.schedule = schedule
         self.createdAt = createdAt
         self.lastRunAt = lastRunAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, sourceFolders, rules, fallbackDestinationPath
+        case includeSubdirectories, preserveFolderStructure, skipHiddenFiles
+        case schedule, createdAt, lastRunAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decode(String.self, forKey: .name)
+        sourceFolders = try c.decodeIfPresent([String].self, forKey: .sourceFolders) ?? []
+        rules = try c.decodeIfPresent([ArchiveRule].self, forKey: .rules) ?? []
+        let rawFallback = try c.decodeIfPresent(String.self, forKey: .fallbackDestinationPath)
+        fallbackDestinationPath = rawFallback?.isEmpty == true ? nil : rawFallback
+        includeSubdirectories = try c.decodeIfPresent(Bool.self, forKey: .includeSubdirectories) ?? true
+        preserveFolderStructure = try c.decodeIfPresent(Bool.self, forKey: .preserveFolderStructure) ?? true
+        skipHiddenFiles = try c.decodeIfPresent(Bool.self, forKey: .skipHiddenFiles) ?? true
+        schedule = try c.decodeIfPresent(ArchiveSchedule.self, forKey: .schedule) ?? ArchiveSchedule()
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        lastRunAt = try c.decodeIfPresent(Date.self, forKey: .lastRunAt)
     }
 
     /// Returns all unique configured destination folders across enabled rules and optional fallback.

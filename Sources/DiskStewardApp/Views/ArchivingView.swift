@@ -6,6 +6,7 @@ import SwiftUI
 struct ArchivingView: View {
     @EnvironmentObject private var appState: AppState
     @State private var editingJob: ArchiveJob?
+    @State private var editingRuleID: UUID?
     @State private var isCreatingNewJob: Bool = false
 
     private var selectedJob: ArchiveJob? {
@@ -148,8 +149,10 @@ struct ArchivingView: View {
             }
             .environmentObject(appState)
         }
-        .sheet(item: $editingJob) { job in
-            ArchiveJobEditorSheet(existingJob: job) { updated in
+        .sheet(item: $editingJob, onDismiss: {
+            editingRuleID = nil
+        }) { job in
+            ArchiveJobEditorSheet(existingJob: job, initialEditingRuleID: editingRuleID) { updated in
                 appState.updateArchiveJob(updated)
             }
             .environmentObject(appState)
@@ -202,6 +205,7 @@ struct ArchivingView: View {
                     }
 
                     Button("Edit") {
+                        editingRuleID = nil
                         editingJob = job
                     }
                     .buttonStyle(.bordered)
@@ -254,6 +258,13 @@ struct ArchivingView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
+                        HStack {
+                            Text("Folder structure:")
+                                .font(.caption.weight(.semibold))
+                            Text(job.preserveFolderStructure ? "Preserve relative subfolders inside destination" : "Flatten files directly into destination folder")
+                                .font(.caption)
+                                .foregroundStyle(job.preserveFolderStructure ? .green : .secondary)
+                        }
                     }
                     .padding(6)
                 }
@@ -294,6 +305,9 @@ struct ArchivingView: View {
                                             Text(rule.destinationFolderPath)
                                                 .font(.caption.monospaced())
                                                 .foregroundStyle(.blue)
+                                            Text(rule.preserveRelativeSubpath ? "• Keep Subfolders" : "• Flat")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
                                         }
                                     }
                                     Spacer()
@@ -308,6 +322,17 @@ struct ArchivingView: View {
                                         .background(available ? Color.green.opacity(0.15) : Color.orange.opacity(0.18))
                                         .foregroundStyle(available ? .green : .orange)
                                         .clipShape(Capsule())
+
+                                    Button {
+                                        editingRuleID = rule.id
+                                        editingJob = job
+                                    } label: {
+                                        Label("Edit", systemImage: "pencil")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                    .help("Edit this classification rule")
                                 }
                                 if idx < job.rules.count - 1 {
                                     Divider()

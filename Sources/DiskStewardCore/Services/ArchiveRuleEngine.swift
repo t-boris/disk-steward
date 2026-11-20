@@ -149,7 +149,7 @@ public struct ArchiveRuleEngine: Sendable {
                     } else if let fallback = job.fallbackDestinationPath, !fallback.isEmpty {
                         destFolder = fallback
                         matchedName = "Fallback Destination"
-                        preserveRelative = false
+                        preserveRelative = job.preserveFolderStructure
                     } else {
                         items.append(
                             RoutedArchiveItem(
@@ -452,10 +452,11 @@ public struct ArchiveRuleEngine: Sendable {
 
         let parentPath = fileURL.deletingLastPathComponent().standardizedFileURL.path
         let rootPath = sourceRootURL.standardizedFileURL.path
-        guard parentPath.hasPrefix(rootPath), parentPath.count > rootPath.count else {
+        let rootPrefix = rootPath == "/" ? "/" : rootPath + "/"
+        guard parentPath.hasPrefix(rootPrefix) else {
             return baseURL
         }
-        var relative = String(parentPath.dropFirst(rootPath.count))
+        var relative = String(parentPath.dropFirst(rootPrefix.count))
         while relative.hasPrefix("/") { relative.removeFirst() }
         guard !relative.isEmpty else { return baseURL }
         return baseURL.appendingPathComponent(relative, isDirectory: true)
@@ -522,38 +523,47 @@ public struct ArchiveRuleEngine: Sendable {
     }
 
     /// Generates practical starter classification rules matching common categories (Pictures, Movies, Installers, Documents, Archives).
-    public static func starterRules(destinationRoot: String, sourceFolderPath: String? = nil) -> [ArchiveRule] {
+    public static func starterRules(
+        destinationRoot: String,
+        sourceFolderPath: String? = nil,
+        preserveRelativeSubpath: Bool = true
+    ) -> [ArchiveRule] {
         let base = URL(fileURLWithPath: destinationRoot, isDirectory: true).standardizedFileURL
         return [
             ArchiveRule(
                 name: "Pictures & Images",
                 fileCategories: [.images],
                 sourceFolderPath: sourceFolderPath,
-                destinationFolderPath: base.appendingPathComponent("Pictures").path
+                destinationFolderPath: base.appendingPathComponent("Pictures").path,
+                preserveRelativeSubpath: preserveRelativeSubpath
             ),
             ArchiveRule(
                 name: "Movies & Videos",
                 fileCategories: [.videos],
                 sourceFolderPath: sourceFolderPath,
-                destinationFolderPath: base.appendingPathComponent("Movies").path
+                destinationFolderPath: base.appendingPathComponent("Movies").path,
+                preserveRelativeSubpath: preserveRelativeSubpath
             ),
             ArchiveRule(
                 name: "Installers & Disk Images",
                 fileCategories: [.installers],
                 sourceFolderPath: sourceFolderPath,
-                destinationFolderPath: base.appendingPathComponent("Installers").path
+                destinationFolderPath: base.appendingPathComponent("Installers").path,
+                preserveRelativeSubpath: preserveRelativeSubpath
             ),
             ArchiveRule(
                 name: "Documents & PDFs",
                 fileCategories: [.documents],
                 sourceFolderPath: sourceFolderPath,
-                destinationFolderPath: base.appendingPathComponent("Documents").path
+                destinationFolderPath: base.appendingPathComponent("Documents").path,
+                preserveRelativeSubpath: preserveRelativeSubpath
             ),
             ArchiveRule(
                 name: "Compressed Archives",
                 fileCategories: [.archives],
                 sourceFolderPath: sourceFolderPath,
-                destinationFolderPath: base.appendingPathComponent("Archives").path
+                destinationFolderPath: base.appendingPathComponent("Archives").path,
+                preserveRelativeSubpath: preserveRelativeSubpath
             )
         ]
     }

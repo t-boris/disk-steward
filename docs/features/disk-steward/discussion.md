@@ -87,3 +87,11 @@ User clarified that when FSEvents detects filesystem changes (e.g. cleaning file
 ### Agent · 2026-11-20
 
 User requested persistent dismissal/ignore for Cleanup Proposals (single item, bulk selected items, or an entire folder) so previously declined proposals stop reappearing and inflating proposal badge counts (DEC-013).
+
+### User & Agent · 2026-11-20
+
+User reported that archiving ~/Documents with no classification rules and a fallback destination flattened all nested files into a flat list in the target folder, and requested preserving folder structure by default along with an explicit setting to control it. Recorded DEC-014: add job-level preserveFolderStructure (default true, backward-compatible for existing jobs) applied to fallback archiving, default per-rule preserveRelativeSubpath to true, and expose toggles in ArchiveJobEditorSheet and ArchivingView.
+
+### User & Agent · 2026-11-20
+
+User also reported that existing source folders and classification rules in ArchiveJobEditorSheet could only be deleted and recreated instead of edited in place. Added inline editing for source folders (editable path field + Choose… folder picker per row) and full in-place editing for classification rules (Edit button on each rule both in ArchivingView and ArchiveJobEditorSheet, enable/disable toggle, and automatic commit of in-progress rule edits on job save).
